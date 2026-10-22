@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Minimal HTTP/1.1 client tuned for the two things this daemon does:
 //! talk to the sing-box Clash API on loopback, and send a handful of probe
 //! requests.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Deterministic routing state machine.
 //!
 //! This module is pure: no I/O, no clocks, no randomness. Every function takes

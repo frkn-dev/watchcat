@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! CLI entry point.
 //!
 //! Modes: run (default), `--check`, `--once`, `--dry-run`, `--set TAG`,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! `mock-clash` — a fake sing-box Clash API plus a fake SOCKS5 inbound.
 //!
 //! Purpose: exercise the whole watchdog against a deterministic target, with no

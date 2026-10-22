@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Parsing primitives — **nom only, no regular expressions anywhere**.
 //!
 //! Everything the daemon has to understand from the outside world is parsed

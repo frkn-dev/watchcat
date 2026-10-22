@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Prometheus textfile metrics.
 //!
 //! One small file rewritten atomically (`metrics.prom.tmp` → rename) at the end

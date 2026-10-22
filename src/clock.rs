@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Time helpers.
 //!
 //! Two clocks are used and never mixed:

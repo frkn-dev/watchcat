@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Structured logging plus the dedicated route-change audit trail.
 //!
 //! Two sinks, deliberately separate:

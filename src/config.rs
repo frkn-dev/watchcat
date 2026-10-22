@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Configuration: YAML file, `.env` file, environment variables, CLI path.
 //!
 //! Precedence (highest wins):

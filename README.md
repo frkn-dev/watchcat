@@ -109,3 +109,7 @@ deploy/             systemd unit, logrotate
 Не поднимает sing-box, не правит iptables/TPROXY, не добавляет ноды в конфиг,
 не балансирует клиентов между нодами и не заменяет rollback-guard перехвата
 (`eu-watchdog.sh`) — он про другой отказ. Подробно: `docs/ARCHITECTURE.md` §9.
+
+## Лицензия
+
+GPL-3.0-only, см. [LICENSE](LICENSE). © 2026 FRKN.

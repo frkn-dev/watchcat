@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Health probes and their classification.
 //!
 //! Two independent probe paths, because they answer different questions:

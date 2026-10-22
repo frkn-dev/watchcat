@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! End-to-end failover test: real binaries, real sockets, no sing-box.
 //!
 //! `mock-clash` plays sing-box (Clash API + a SOCKS5 inbound), `watchcat` runs

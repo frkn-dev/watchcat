@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "sing-box outbound watchdog: Clash API health detection and selector failover"
-license = "proprietary"
+license = "GPL-3.0-only"
 publish = false
 
 [dependencies]

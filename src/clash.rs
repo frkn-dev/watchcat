@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Clash API client (the sing-box control surface).
 //!
 //! Only four endpoints are used:

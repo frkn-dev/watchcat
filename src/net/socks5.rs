@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 FRKN
 //! Minimal SOCKS5 client (RFC 1928, no auth, CONNECT only).
 //!
 //! Used by the end-to-end probe: it drives the *same* local proxy inbound that
