@@ -1,0 +1,17 @@
+/target
+*.log
+*.jsonl
+!docs/**/*.jsonl
+
+# Внутреннее: отчёт заказчику и статус работ — не для публичного репозитория.
+REPORT.md
+REPORT.pdf
+report/
+HUMANS.md
+
+# Секреты и локальные конфиги
+/servers/.sync-passwords
+config.yaml
+.env
+*.pem
+*.key

@@ -1,0 +1,62 @@
+[Unit]
+Description=Watchcat — sing-box outbound watchdog (Clash API failover)
+Documentation=file:/opt/watchcat/docs/OPERATIONS.md
+After=network-online.target sing-box.service
+Wants=network-online.target
+# Не падать вместе с sing-box: демон переживает рестарт ядра и продолжает
+# снимать метрики/писать «clash_api_unavailable», что полезнее для диагностики.
+#
+# StartLimit* — директивы [Unit], не [Service]: в [Service] systemd их молча
+# игнорирует (и раньше `StartLimitIntervalSec=0` в [Unit] вообще отключал
+# лимит, из-за чего битый конфиг крутил рестарт-луп вечно).
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/opt/watchcat/watchcat --config /etc/watchcat/config.yaml
+EnvironmentFile=-/etc/watchcat/env
+User=root
+Group=root
+WorkingDirectory=/opt/watchcat
+
+Restart=always
+RestartSec=3
+# Битый конфиг (1) и кривые аргументы (3) рестартом не лечатся — пусть юнит
+# останавливается в failed, а не долбится в цикле.
+RestartPreventExitStatus=1 3
+
+# --- ресурсы -------------------------------------------------------------
+# Демон живёт в < 10 MiB; потолок нужен, чтобы утечка не съела ноду.
+MemoryMax=64M
+TasksMax=32
+Nice=-5
+OOMPolicy=stop
+
+# --- песочница -----------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/log/watchcat
+
+# --- журнал --------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watchcat
+
+# Живой аудит-журнал не должен обрезаться journald.
+LogExtraFields=WATCHCAT=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,85 @@
+# watchcat — пример конфигурации.
+#
+# Копировать в /etc/watchcat/config.yaml. Все ключи опциональны: значения ниже
+# совпадают с дефолтами, кроме secret/audit — их надо задать.
+#
+# Приоритет источников: env (WATCHCAT_*) > .env > этот файл > дефолты.
+# Секреты лучше держать в env/.env, а не здесь: файл читается с диска, а
+# переменные окружения systemd можно закрыть 0600.
+
+api:
+  # Clash API sing-box. Только loopback по HTTP: TLS у Clash API нет,
+  # validate() откажется стартовать с https:// — для удалённого доступа нужен
+  # SSH-туннель, а не самоподписанный сертификат.
+  base_url: "http://127.0.0.1:9090"
+  # Тот же секрет, что в experimental.clash_api.secret. Пусто = без авторизации
+  # (допустимо только если API точно не выставлен наружу).
+  secret: ""
+  connect_timeout_ms: 500
+  timeout_ms: 1500
+
+selector:
+  # Тег группы type=selector в config.json sing-box.
+  tag: main-outbound
+  # Пусто = состав пула берётся из ответа API (поле `all`). Явный список нужен,
+  # если хотите фиксировать порядок/приоритеты/протоколы.
+  nodes: []
+  #   - tag: node-01-fr-vless
+  #     priority: 100
+  #   - tag: node-02-de-hysteria
+  #     protocol: hysteria2
+  #     priority: 50
+  #     pinned: false
+  # true = если оператор переключил селектор руками (curl/UI), демон принимает
+  # это как новую истину и пишет active_adopted в audit, а не воюет с ним.
+  adopt_external_changes: true
+
+probe:
+  interval_ms: 5000          # обычный цикл
+  fast_interval_ms: 1000     # цикл, пока активная нода больна/в карантине
+  timeout_ms: 2000           # таймаут одной пробы (и Clash delay, и e2e)
+  concurrency: 10            # сколько проб параллельно (≈ размер пула)
+  method: both               # clash_delay | end_to_end | both
+  base_url: "https://1.1.1.1/cdn-cgi/trace"
+  critical_url: "https://api.openai.com/v1/models"
+  critical_every_ticks: 3    # критический эндпоинт раз в 3 тика; 0 = выключить
+  accept_status: [200, 204, 206, 301, 302, 307, 308, 400, 401, 404]
+  block_status: [403, 406, 451]
+  # SOCKS-инбаунд, через который ходит end-to-end проба (тот же, что у клиентов).
+  e2e_proxy: "socks5://127.0.0.1:10808"
+  e2e_enabled: true
+  e2e_detect_intercept: true
+
+policy:
+  fail_threshold: 2          # подряд жёстких провалов до карантина
+  quarantine_ms: 300000      # 5 минут
+  geo_quarantine_ms: 0       # 0 = блок не отправляет ноду в карантин, только в приоритет
+  degrade_ms: 1200           # абсолютный потолок EWMA
+  degrade_factor_pct: 250    # или 2.5× медианы здоровых нод
+  min_switch_interval_ms: 1500
+  switch_margin_pct: 20      # кандидат должен быть на 20% быстрее, иначе не дёргаем
+  recovery_probes: 2         # сколько успехов подряд нужно для выхода из карантина
+  ewma_alpha_permille: 300   # вес нового семпла (30%)
+  stale_ms: 60000            # нет свежего семпла — нода не кандидат
+  protocol_penalty_us: 0     # штраф за ранг протокола (включается при блоках)
+  prefer_protocol_on_block: true
+  protocol_preference: [hysteria2, vless-reality, tuic, vless, anytls, trojan, shadowsocks, wireguard]
+
+logging:
+  level: info                # trace|debug|info|warn|error
+  format: json               # json | text
+  stdout: true
+  # Отдельный журнал всех изменений маршрутизации. null = не писать файл.
+  audit_path: "/var/log/watchcat/routes.jsonl"
+  fsync_audit: false         # true = fdatasync на каждую запись (медленнее, надёжнее)
+
+metrics:
+  enabled: true
+  path: "/var/log/watchcat/metrics.prom"   # для node_exporter textfile-collector
+
+telegram:
+  enabled: false
+  bot_token: ""              # лучше через WATCHCAT_TELEGRAM_TOKEN
+  chat_id: ""
+  api_base: "https://api.telegram.org"
+  min_interval_ms: 3000

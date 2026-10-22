@@ -1,0 +1,194 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "CHANGE_ME_STRONG_SECRET"
+    }
+  },
+  "inbounds": [
+    {
+      "type": "redirect",
+      "tag": "redirect-in",
+      "listen": "10.77.0.1",
+      "listen_port": 12345
+    },
+    {
+      "type": "tproxy",
+      "tag": "udp-in",
+      "listen": "127.0.0.1",
+      "listen_port": 12346,
+      "network": "udp"
+    },
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 10808
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "main-outbound",
+      "outbounds": [
+        "node-01-fr-vless",
+        "node-02-de-hysteria",
+        "node-03-nl-shadowsocks",
+        "node-04-fi-tuic",
+        "node-05-se-vless",
+        "node-06-pl-hysteria",
+        "node-07-ee-wireguard",
+        "node-08-de-reality",
+        "node-09-fr-hysteria",
+        "node-10-cz-vless"
+      ],
+      "default": "node-01-fr-vless"
+    },
+
+    {
+      "type": "vless",
+      "tag": "node-01-fr-vless",
+      "server": "fr1.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "tls": {
+        "enabled": true,
+        "server_name": "fr1.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "node-02-de-hysteria",
+      "server": "de1.example.com",
+      "server_port": 8443,
+      "password": "REPLACE_WITH_HYSTERIA2_TOKEN",
+      "tls": {
+        "enabled": true,
+        "server_name": "de1.example.com"
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "node-03-nl-shadowsocks",
+      "server": "nl1.example.com",
+      "server_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "REPLACE_WITH_SS_PASSWORD"
+    },
+    {
+      "type": "tuic",
+      "tag": "node-04-fi-tuic",
+      "server": "fi1.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000004",
+      "password": "REPLACE_WITH_TUIC_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "fi1.example.com"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "node-05-se-vless",
+      "server": "se1.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000005",
+      "tls": {
+        "enabled": true,
+        "server_name": "se1.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "node-06-pl-hysteria",
+      "server": "pl1.example.com",
+      "server_port": 8443,
+      "password": "REPLACE_WITH_HYSTERIA2_TOKEN",
+      "tls": {
+        "enabled": true,
+        "server_name": "pl1.example.com"
+      }
+    },
+    {
+      "type": "wireguard",
+      "tag": "node-07-ee-wireguard",
+      "server": "ee1.example.com",
+      "server_port": 51820,
+      "local_address": ["10.66.0.2/32"],
+      "private_key": "REPLACE_WITH_WIREGUARD_PRIVATE_KEY",
+      "peer_public_key": "REPLACE_WITH_WIREGUARD_PUBLIC_KEY"
+    },
+    {
+      "type": "vless",
+      "tag": "node-08-de-reality",
+      "server": "de2.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000008",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "REPLACE_WITH_REALITY_PUBLIC_KEY",
+          "short_id": "0123456789abcdef"
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "node-09-fr-hysteria",
+      "server": "fr2.example.com",
+      "server_port": 8443,
+      "password": "REPLACE_WITH_HYSTERIA2_TOKEN",
+      "tls": {
+        "enabled": true,
+        "server_name": "fr2.example.com"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "node-10-cz-vless",
+      "server": "cz1.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000010",
+      "tls": {
+        "enabled": true,
+        "server_name": "cz1.example.com"
+      }
+    },
+
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "outbound": "block",
+        "ip_is_private": true
+      },
+      {
+        "outbound": "block",
+        "protocol": "bittorrent"
+      }
+    ],
+    "final": "main-outbound"
+  }
+}
