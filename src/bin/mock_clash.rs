@@ -43,7 +43,11 @@ const NODES: [&str; 10] = [
 struct Config {
     api_addr: String,
     socks_addr: Option<String>,
-    selector: String,
+    /// Группы, которые отдаёт мок. Первая — та, через которую ходит SOCKS-путь.
+    selectors: Vec<String>,
+    /// Свой состав для конкретной группы: `--pool TAG=node-a,node-b`.
+    /// Нужен, чтобы проверить изоляцию: одна группа ломается, вторая стоит.
+    pools: HashMap<String, Vec<String>>,
     secret: Option<String>,
     fail: Option<String>,
     /// Node starts failing after this many delay probes (0 = immediately).
@@ -54,7 +58,8 @@ struct Config {
 }
 
 struct State {
-    now: String,
+    /// Активный член каждой группы: у мульти-группы своё состояние на группу.
+    now: HashMap<String, String>,
     probes: HashMap<String, u32>,
     switches: u32,
 }
@@ -63,7 +68,8 @@ fn main() {
     let mut config = Config {
         api_addr: "127.0.0.1:19090".to_string(),
         socks_addr: Some("127.0.0.1:19080".to_string()),
-        selector: "main-outbound".to_string(),
+        selectors: vec!["main-outbound".to_string()],
+        pools: HashMap::new(),
         secret: None,
         fail: None,
         fail_after: 0,
@@ -82,7 +88,16 @@ fn main() {
             "--api" => config.api_addr = take("--api"),
             "--socks" => config.socks_addr = Some(take("--socks")),
             "--no-socks" => config.socks_addr = None,
-            "--selector" => config.selector = take("--selector"),
+            "--selector" => config.selectors = vec![take("--selector")],
+            // Несколько групп: `--selectors fr-exit,bt-exit`.
+            "--selectors" => {
+                config.selectors = take("--selectors")
+                    .split(',')
+                    .map(|tag| tag.trim().to_string())
+                    .filter(|tag| !tag.is_empty())
+                    .collect();
+                assert!(!config.selectors.is_empty(), "--selectors: empty list");
+            }
             "--secret" => config.secret = Some(take("--secret")),
             "--fail" => config.fail = Some(take("--fail")),
             "--fail-after" => {
@@ -93,6 +108,17 @@ fn main() {
                 let spec = take("--slow");
                 let (tag, ms) = spec.rsplit_once(':').expect("--slow TAG:MS");
                 config.slow = Some((tag.to_string(), ms.parse().expect("ms")));
+            }
+            "--pool" => {
+                let spec = take("--pool");
+                let (tag, members) = spec.split_once('=').expect("--pool TAG=node-a,node-b");
+                let members: Vec<String> = members
+                    .split(',')
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty())
+                    .collect();
+                assert!(!members.is_empty(), "--pool: empty member list");
+                config.pools.insert(tag.to_string(), members);
             }
             "--nodes" => {
                 let n: usize = take("--nodes").parse().expect("--nodes: usize");
@@ -105,7 +131,8 @@ fn main() {
             "-h" | "--help" => {
                 println!(
                     "mock-clash [--api ADDR] [--socks ADDR|--no-socks] [--selector TAG]\n\
-                     \x20          [--secret S] [--fail TAG] [--fail-after N] [--slow TAG:MS]\n\
+                     \x20          [--selectors A,B] [--secret S] [--fail TAG]\n\
+                     \x20          [--pool TAG=a,b] [--fail-after N] [--slow TAG:MS]\n\
                      \x20          [--block TAG] [--nodes N]"
                 );
                 return;
@@ -121,7 +148,14 @@ fn main() {
 
     runtime.block_on(async move {
         let state = Arc::new(Mutex::new(State {
-            now: config.nodes[0].clone(),
+            now: config
+                .selectors
+                .iter()
+                .map(|tag| {
+                    let pool = config.pools.get(tag).unwrap_or(&config.nodes);
+                    (tag.clone(), pool[0].clone())
+                })
+                .collect(),
             probes: HashMap::new(),
             switches: 0,
         }));
@@ -229,36 +263,54 @@ fn route(
     state: &Arc<Mutex<State>>,
     config: &Config,
 ) -> Vec<u8> {
-    let selector_path = format!("/proxies/{}", config.selector);
     if method == "GET" && path == "/version" {
         return json_response(200, "{\"version\":\"mock-1.0.0\"}");
     }
 
-    if method == "GET" && path == selector_path {
-        let state = state.lock().unwrap();
-        let body = json!({
-            "type": "Selector",
-            "now": state.now,
-            "all": config.nodes,
-        });
-        return json_response(200, &body.to_string());
+    // К какому селектору относится путь (у мульти-группы их несколько).
+    let selector = config
+        .selectors
+        .iter()
+        .find(|tag| path == format!("/proxies/{tag}").as_str());
+
+    let pool = |tag: &str| -> Vec<String> {
+        config
+            .pools
+            .get(tag)
+            .cloned()
+            .unwrap_or_else(|| config.nodes.clone())
+    };
+
+    if method == "GET" {
+        if let Some(tag) = selector {
+            let state = state.lock().unwrap();
+            let body = json!({
+                "type": "Selector",
+                "now": state.now.get(tag).cloned().unwrap_or_default(),
+                "all": pool(tag),
+            });
+            return json_response(200, &body.to_string());
+        }
     }
 
-    if method == "PUT" && path == selector_path {
+    if method == "PUT" {
+        let Some(tag) = selector else {
+            return json_response(404, "{\"message\":\"no such proxy\"}");
+        };
         let name = parse_name(head);
         let mut state = state.lock().unwrap();
         let Some(name) = name else {
             return json_response(400, "{\"message\":\"missing name\"}");
         };
-        if !config.nodes.contains(&name) {
+        if !pool(tag).contains(&name) {
             return json_response(400, "{\"message\":\"not a member\"}");
         }
-        let from = state.now.clone();
-        state.now = name.clone();
+        let from = state.now.get(tag).cloned().unwrap_or_default();
+        state.now.insert(tag.clone(), name.clone());
         state.switches += 1;
         println!(
-            "MOCK_SWITCH {} -> {} (total {})",
-            from, name, state.switches
+            "MOCK_SWITCH {} {} -> {} (total {})",
+            tag, from, name, state.switches
         );
         return "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
             .as_bytes()
@@ -356,14 +408,14 @@ async fn serve_socks(
         let blocked = config
             .block
             .as_deref()
-            .map(|tag| tag == state.now)
+            .map(|tag| state.now.get(&config.selectors[0]).map(|now| now == tag).unwrap_or(false))
             .unwrap_or(false);
         // Derive a stable fake exit country from the active tag.
-        let loc = if state.now.contains("-de-") {
+        let loc = if state.now.get(&config.selectors[0]).map(|t| t.contains("-de-")).unwrap_or(false) {
             "DE"
-        } else if state.now.contains("-nl-") {
+        } else if state.now.get(&config.selectors[0]).map(|t| t.contains("-nl-")).unwrap_or(false) {
             "NL"
-        } else if state.now.contains("-cz-") {
+        } else if state.now.get(&config.selectors[0]).map(|t| t.contains("-cz-")).unwrap_or(false) {
             "CZ"
         } else {
             "FR"

@@ -31,6 +31,9 @@ pub const CHANNEL_CAPACITY: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyEvent {
     Switch {
+        /// Группа выходов: без неё «[SWITCH] a → b» не говорит, что именно
+        /// переключилось, когда групп несколько.
+        group: String,
         from: Option<String>,
         to: String,
         reason: String,
@@ -38,18 +41,22 @@ pub enum NotifyEvent {
         api_roundtrip_ms: Option<u64>,
     },
     Quarantine {
+        group: String,
         tag: String,
         reason: String,
         quarantine_ms: u64,
         fails: u32,
     },
     Recovered {
+        group: String,
         tag: String,
     },
     NoHealthy {
+        group: String,
         active: Option<String>,
     },
     InterceptBroken {
+        group: String,
         detail: String,
     },
 }
@@ -58,6 +65,7 @@ impl NotifyEvent {
     pub fn render(&self) -> String {
         match self {
             NotifyEvent::Switch {
+                group,
                 from,
                 to,
                 reason,
@@ -68,24 +76,29 @@ impl NotifyEvent {
                 let api = api_roundtrip_ms
                     .map(|ms| format!(" · api {ms} ms"))
                     .unwrap_or_default();
-                format!("[SWITCH] {from} → {to}\nreason: {reason}\nlatency: {latency_ms} ms{api}")
+                format!(
+                    "[SWITCH] {group}: {from} → {to}\nreason: {reason}\nlatency: {latency_ms} ms{api}"
+                )
             }
             NotifyEvent::Quarantine {
+                group,
                 tag,
                 reason,
                 quarantine_ms,
                 fails,
             } => format!(
-                "[QUARANTINE] {tag}\nreason: {reason} ({fails} consecutive)\nfor: {} s",
+                "[QUARANTINE] {group}: {tag}\nreason: {reason} ({fails} consecutive)\nfor: {} s",
                 quarantine_ms / 1000
             ),
-            NotifyEvent::Recovered { tag } => format!("[RECOVERED] {tag} is selectable again"),
-            NotifyEvent::NoHealthy { active } => format!(
-                "[OUTAGE] no healthy outbound\nactive: {}",
+            NotifyEvent::Recovered { group, tag } => {
+                format!("[RECOVERED] {group}: {tag} is selectable again")
+            }
+            NotifyEvent::NoHealthy { group, active } => format!(
+                "[OUTAGE] {group}: no healthy outbound\nactive: {}",
                 active.as_deref().unwrap_or("none")
             ),
-            NotifyEvent::InterceptBroken { detail } => format!(
-                "[INTERCEPT] local proxy path is broken, switching nodes will not help\n{detail}"
+            NotifyEvent::InterceptBroken { group, detail } => format!(
+                "[INTERCEPT] {group}: local proxy path is broken, switching nodes will not help\n{detail}"
             ),
         }
     }
@@ -273,6 +286,7 @@ mod tests {
     #[test]
     fn renders_switch_message() {
         let text = NotifyEvent::Switch {
+            group: "fr-exit".into(),
             from: Some("node-01-fr-vless".into()),
             to: "node-02-de-hysteria".into(),
             reason: "active_failed".into(),
@@ -280,7 +294,7 @@ mod tests {
             api_roundtrip_ms: Some(3),
         }
         .render();
-        assert!(text.contains("[SWITCH] node-01-fr-vless → node-02-de-hysteria"));
+        assert!(text.contains("[SWITCH] fr-exit: node-01-fr-vless → node-02-de-hysteria"));
         assert!(text.contains("reason: active_failed"));
         assert!(text.contains("api 3 ms"));
     }
@@ -288,6 +302,7 @@ mod tests {
     #[test]
     fn throttle_dedupes_and_rate_limits() {
         let event = NotifyEvent::Recovered {
+            group: "fr-exit".into(),
             tag: "node-03".into(),
         };
         let mut throttle = Throttle::new(1_000);
@@ -296,6 +311,7 @@ mod tests {
         assert!(throttle.check(&event, 10_500).is_none());
         // Different message but inside the rate-limit window: suppressed.
         let other = NotifyEvent::Quarantine {
+            group: "fr-exit".into(),
             tag: "node-04".into(),
             reason: "failed".into(),
             quarantine_ms: 300_000,
@@ -306,9 +322,28 @@ mod tests {
         assert!(throttle.check(&other, 11_500).is_some());
     }
 
+    /// Две группы, один и тот же узел: сообщения не должны схлопываться в
+    /// одно дедупом, иначе «bt-exit упал» потеряется за «fr-exit упал».
+    #[test]
+    fn group_distinguishes_identical_nodes() {
+        let a = NotifyEvent::Recovered {
+            group: "fr-exit".into(),
+            tag: "ufo-fr49".into(),
+        };
+        let b = NotifyEvent::Recovered {
+            group: "bt-exit".into(),
+            tag: "ufo-fr49".into(),
+        };
+        let mut throttle = Throttle::new(0);
+        assert!(throttle.check(&a, 10_000).is_some());
+        assert!(throttle.check(&b, 10_100).is_some());
+        assert_ne!(a.render(), b.render());
+    }
+
     #[test]
     fn dedupe_expires() {
         let event = NotifyEvent::NoHealthy {
+            group: "fr-exit".into(),
             active: Some("node-01".into()),
         };
         let mut throttle = Throttle::new(0);
@@ -321,10 +356,15 @@ mod tests {
 
     #[test]
     fn renders_outage_and_intercept() {
-        let outage = NotifyEvent::NoHealthy { active: None }.render();
+        let outage = NotifyEvent::NoHealthy {
+            group: "fr-exit".into(),
+            active: None,
+        }
+        .render();
         assert!(outage.contains("[OUTAGE]"));
         assert!(outage.contains("active: none"));
         let intercept = NotifyEvent::InterceptBroken {
+            group: "fr-exit".into(),
             detail: "socks refused".into(),
         }
         .render();

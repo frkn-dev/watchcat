@@ -4,9 +4,10 @@ Watchdog для выходных нод sing-box: следит за здоров
 `selector` через Clash API за миллисекунды, без перезапуска ядра.
 
 ```
-клиенты → AWG/WG → sing-box (route.rules) → selector main-outbound → нода
-                                                    ↑
-                                          watchcat (PUT /proxies/main-outbound)
+клиенты → AWG/WG → sing-box (route.rules) → selector fr-exit → нода
+                                         → selector bt-exit → нода
+                                              ↑
+                          watchcat (PUT /proxies/{group}), N групп в процессе
 ```
 
 ## Что делает
@@ -22,6 +23,9 @@ Watchdog для выходных нод sing-box: следит за здоров
   1.5 s против флаппинга);
 * пишет **отдельный audit-журнал** всех изменений маршрутизации (JSONL) и
   метрики Prometheus textfile;
+* держит **несколько групп выходов** в одном процессе (`selectors:`): падение
+  участника `fr-exit` не трогает `bt-exit`, у каждой группы своё состояние,
+  свой период проб и свои метрики с лейблом `group`;
 * ничего не перезапускает и не трогает iptables — только `PUT /proxies/…`.
 
 ## Быстрый старт
@@ -51,14 +55,15 @@ cat /tmp/wcdemo/routes.jsonl
 ## Тесты
 
 ```bash
-cargo test              # 95 unit + 5 e2e (живые бинари, реальные сокеты)
+cargo test              # 107 unit + 6 e2e (живые бинари, реальные сокеты)
 cargo test --test failover
 cargo test --lib -- --ignored          # opt-in: настоящий TLS-handshake к 1.1.1.1
 ```
 
 Покрыто: парсеры (nom, включая битые ответы), HTTP/SOCKS/TLS клиенты, машина
 состояний (карантин, восстановление, гистерезис, cooldown, гео-блоки, «все
-мертвы»), конфиг, аудит, метрики, полный цикл failover и dry-run.
+мертвы»), конфиг (включая мульти-группу и оверрайды), аудит, метрики, полный
+цикл failover, dry-run и изоляцию двух групп.
 
 ## Характеристики
 
@@ -90,7 +95,7 @@ cargo test --lib -- --ignored          # opt-in: настоящий TLS-handshak
 ## Структура
 
 ```
-src/supervisor.rs   цикл reconcile → probe → decide → apply
+src/supervisor.rs   GroupSupervisor (одна группа) + SupervisorSet (N групп)
 src/state.rs        чистая машина состояний (без I/O) + выбор кандидата
 src/health.rs       пробы и классификация исходов
 src/clash.rs        Clash API клиент

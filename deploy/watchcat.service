@@ -15,7 +15,6 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=/opt/watchcat/watchcat --config /etc/watchcat/config.yaml
-EnvironmentFile=-/etc/watchcat/env
 User=root
 Group=root
 WorkingDirectory=/opt/watchcat

@@ -8,18 +8,43 @@ iptables, без участия в жизни клиентских пиров.
 
 ```
 клиент (AWG/WG)
-  → [REDIRECT/TPROXY]  sing-box: inbound → route.rules → selector main-outbound
-                                                            ↑
-                                            PUT /proxies/main-outbound
-                                                            │
-                                          watchcat ─ GET /proxies/main-outbound
-                                                   └─ GET /proxies/{tag}/delay
-                                                   └─ (опц.) SOCKS5 → TLS → GET https://…
+  → [REDIRECT/TPROXY]  sing-box: inbound → route.rules → selector fr-exit
+                                                        selector bt-exit
+                                                            ↑   ↑
+                                       PUT /proxies/{group} │   │
+                                                            │   │
+                          watchcat ─ GroupSupervisor(fr-exit) ──┤
+                                   GroupSupervisor(bt-exit) ────┘
+                                     └─ GET /proxies/{group}
+                                     └─ GET /proxies/{tag}/delay
+                                     └─ (опц.) SOCKS5 → TLS → GET https://…
   → выбранная нода (vless-reality / hysteria2 / tuic / ss / wg)
 ```
 
 watchcat живёт рядом с sing-box на той же машине и общается с ним по loopback.
 Никаких данных через него не проходит: это управляющий контур, а не дата-план.
+
+### Группы выходов
+
+Один процесс держит N групп (`selectors:` в конфиге). У каждой — свой
+`GroupSupervisor` со своим состоянием: карантин, EWMA, активный член,
+счётчики. Переключение в одной группе не трогает остальные, а ошибка Clash API
+на одной не останавливает тики других (per-group backoff).
+
+Тики идут **последовательно**, а не параллельно: на 1 vCPU иначе 5 групп ×
+`concurrency` превращаются в полтора десятка одновременных проб. Побочный
+плюс — `probe.concurrency` работает как общий лимит без отдельного семафора.
+
+Группа, которую нельзя вести, отключается и не мешает остальным:
+
+| ситуация | что делает |
+|---|---|
+| тега нет в `/proxies/{tag}` (404) | warn `selector_missing`, группа в `disabled`; тег вернулся → `selector_recovered`, работает без рестарта |
+| тег есть, но это не `selector` (`urltest`, `direct`) | один warn `selector_not_controllable`, группа в `disabled` — два водителя на одну группу конфликтуют |
+| Clash API недоступен | per-group backoff 1s → 30s, состояние не мутируется |
+
+Метрики: серии без лейбла — сумма по группам (совместимость со старыми
+дашбордами), с лейблом `group` — по конкретной группе.
 
 ### Почему не встроенный `urltest`
 
@@ -43,7 +68,7 @@ watchcat живёт рядом с sing-box на той же машине и об
 
 | Файл | Ответственность | Строк |
 |---|---|---|
-| `src/supervisor.rs` | цикл: reconcile → probe → decide → apply → metrics | 600 |
+| `src/supervisor.rs` | `GroupSupervisor` (цикл одной группы) + `SupervisorSet` (оркестратор, метрики) | 865 |
 | `src/state.rs` | **чистая** машина состояний и выбор кандидата | 1228 |
 | `src/health.rs` | пробы (Clash delay + end-to-end) и классификация | 456 |
 | `src/clash.rs` | Clash API: selector/delay/PUT | 456 |
@@ -52,18 +77,18 @@ watchcat живёт рядом с sing-box на той же машине и об
 | `src/net/tls.rs` | rustls + webpki-roots, один `ClientConfig` на процесс | 99 |
 | `src/parse.rs` | **все** парсеры на nom (без regex) | 730 |
 | `src/log.rs` | JSON-лог + отдельный audit-журнал | 505 |
-| `src/config.rs` | YAML + `.env` + env, валидация | 727 |
-| `src/metrics.rs` | Prometheus textfile, атомарная перезапись | 277 |
+| `src/config.rs` | YAML + `.env` + env, группы, валидация | 1071 |
+| `src/metrics.rs` | Prometheus textfile с лейблом `group`, атомарная перезапись | 448 |
 | `src/notify.rs` | Telegram (опционально), троттлинг и дедуп | 404 |
 | `src/clock.rs` | монотонное время + RFC3339 без внешних крейтов | 99 |
-| `src/bin/mock_clash.rs` | фейковый Clash API + SOCKS для тестов и демо | 414 |
-| `tests/failover.rs` | e2e-тесты на живых бинарях | 414 |
+| `src/bin/mock_clash.rs` | фейковый Clash API (N групп, свой пул на группу) + SOCKS | 468 |
+| `tests/failover.rs` | e2e-тесты на живых бинарях | 558 |
 
-Всего ~7.4k строк, из них ~1.3k — тесты внутри модулей (99 тестов).
+Всего ~8.2k строк, из них ~1.4k — тесты внутри модулей (107 тестов) плюс 6 e2e.
 
 ## 3. Один тик
 
-`Supervisor::tick()` — линейная последовательность, каждый шаг которой может
+`GroupSupervisor::tick()` — линейная последовательность, каждый шаг которой может
 «ничего не делать», но не может оставить систему в полу-состоянии:
 
 1. **`GET /proxies/{selector}`** — `now` (текущая нода) и `all` (состав пула).

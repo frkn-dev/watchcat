@@ -26,10 +26,10 @@ use tokio::sync::mpsc;
 
 use crate::clash::{ClashClient, ClashError};
 use crate::clock;
-use crate::config::{Config, ProbeMethod};
+use crate::config::{Config, GroupConfig, ProbeConfig, ProbeMethod};
 use crate::health::{ProbeEngine, ProbeReport};
 use crate::log::{AuditRecord, Logs};
-use crate::metrics::{Extra, MetricsWriter};
+use crate::metrics::{Extra, GroupView, MetricsWriter};
 use crate::notify::{send_async, NotifyEvent};
 use crate::state::{Event, NodeSpec, Outcome, RouterState, Switch};
 
@@ -41,13 +41,20 @@ pub struct TickStats {
     pub duration_ms: u64,
 }
 
-pub struct Supervisor {
+/// Один супервизор на одну группу выходов.
+///
+/// Всё состояние (EWMA, карантин, активный член, счётчики) живёт здесь, поэтому
+/// группы не могут повлиять друг на друга: переключение в `fr-exit` не трогает
+/// `bt-exit`, а ошибка Clash API на одной группе не останавливает остальные.
+pub struct GroupSupervisor {
     cfg: Config,
+    group: GroupConfig,
+    probe_cfg: ProbeConfig,
+    adopt: bool,
     clash: Arc<ClashClient>,
     probes: ProbeEngine,
     router: RouterState,
     logs: Logs,
-    metrics: MetricsWriter,
     notifier: Option<mpsc::Sender<NotifyEvent>>,
     extra: Extra,
     tick_count: u64,
@@ -55,27 +62,44 @@ pub struct Supervisor {
     api_backoff_ms: u64,
     last_switch_unix: u64,
     start_ms: u64,
-    metrics_error_logged: bool,
     warned_missing: Vec<String>,
+    /// Группа отключена: тег пропал из sing-box или это не `selector`.
+    /// Тикаем редко, чтобы заметить возврат, но не шуметь.
+    disabled: Option<DisabledReason>,
 }
 
-impl Supervisor {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisabledReason {
+    Missing,
+    NotControllable,
+}
+
+impl DisabledReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisabledReason::Missing => "selector_missing",
+            DisabledReason::NotControllable => "selector_not_controllable",
+        }
+    }
+}
+
+impl GroupSupervisor {
     pub fn new(
-        cfg: Config,
+        cfg: &Config,
+        group: GroupConfig,
         logs: Logs,
         notifier: Option<mpsc::Sender<NotifyEvent>>,
         dry_run: bool,
-    ) -> Result<Supervisor, String> {
+    ) -> Result<GroupSupervisor, String> {
         let clash = Arc::new(ClashClient::new(&cfg.api)?);
-        let probes = ProbeEngine::new(clash.clone(), &cfg.probe)?;
-        let policy = cfg.policy();
-        let metrics = MetricsWriter::new(&cfg.metrics.path, cfg.metrics.enabled);
-        Ok(Supervisor {
+        let probe_cfg = cfg.probe_for(&group);
+        let probes = ProbeEngine::new(clash.clone(), &probe_cfg)?;
+        let policy = cfg.policy_for(&group);
+        Ok(GroupSupervisor {
             router: RouterState::new(policy),
             clash,
             probes,
             logs,
-            metrics,
             notifier,
             extra: Extra::default(),
             tick_count: 0,
@@ -83,14 +107,37 @@ impl Supervisor {
             api_backoff_ms: 0,
             last_switch_unix: 0,
             start_ms: clock::mono_ms(),
-            metrics_error_logged: false,
             warned_missing: Vec::new(),
-            cfg,
+            disabled: None,
+            adopt: cfg.adopt_external(&group),
+            probe_cfg,
+            group,
+            cfg: cfg.clone(),
         })
+    }
+
+    pub fn tag(&self) -> &str {
+        &self.group.tag
     }
 
     pub fn router(&self) -> &RouterState {
         &self.router
+    }
+
+    pub fn extra(&self) -> &Extra {
+        &self.extra
+    }
+
+    pub fn uptime_ms(&self) -> u64 {
+        clock::mono_ms().saturating_sub(self.start_ms)
+    }
+
+    pub fn configured_nodes(&self) -> usize {
+        self.cfg.node_specs_for(&self.group).len()
+    }
+
+    pub fn disabled_reason(&self) -> Option<DisabledReason> {
+        self.disabled
     }
 
     pub fn config(&self) -> &Config {
@@ -102,7 +149,7 @@ impl Supervisor {
         if self.probes.critical_url().is_none() {
             return false;
         }
-        match self.cfg.probe.critical_every_ticks {
+        match self.probe_cfg.critical_every_ticks {
             0 => false,
             n => self.tick_count % n as u64 == 0,
         }
@@ -116,8 +163,31 @@ impl Supervisor {
         let now = clock::mono_ms();
 
         // 1. Selector state.
-        let selector = match self.clash.selector(&self.cfg.selector.tag).await {
+        //
+        // Три разных исхода, и путать их нельзя: API недоступен (backoff),
+        // тег пропал из sing-box (группа в disabled, остальные тикают) и тег
+        // есть, но это не selector. Последний случай раньше был тихим отказом:
+        // тики шли, `switches_total` замирал, ошибок не было — группа час
+        // прожила под `urltest`, а в отчёте выглядела здоровой.
+        let selector = match self.clash.selector(&self.group.tag).await {
             Ok(state) => state,
+            Err(ClashError::NotFound(_)) => {
+                stats = self.mark_disabled(DisabledReason::Missing, stats, started);
+                return stats;
+            }
+            Err(ClashError::NotSelector { ref kind, .. }) => {
+                self.extra.api_ok = true;
+                self.logs.warn(
+                    "selector_not_controllable",
+                    json!({
+                        "group": self.group.tag,
+                        "type": kind,
+                        "note": "watchdog manages `selector` only; this group is left alone",
+                    }),
+                );
+                stats = self.mark_disabled(DisabledReason::NotControllable, stats, started);
+                return stats;
+            }
             Err(err) => {
                 self.extra.api_errors_total += 1;
                 self.extra.api_ok = false;
@@ -125,13 +195,12 @@ impl Supervisor {
                 self.logs.warn(
                     "clash_api_unavailable",
                     json!({
-                        "selector": self.cfg.selector.tag,
+                        "group": self.group.tag,
                         "error": err.to_string(),
                         "backoff_ms": self.api_backoff_ms,
                     }),
                 );
                 stats.duration_ms = started.elapsed().as_millis() as u64;
-                self.write_metrics(stats.duration_ms);
                 return stats;
             }
         };
@@ -139,8 +208,16 @@ impl Supervisor {
         self.extra.api_ok = true;
         self.api_backoff_ms = 0;
 
+        // Группа вернулась: тег снова на месте и это снова selector.
+        if let Some(was) = self.disabled.take() {
+            self.logs.info(
+                "selector_recovered",
+                json!({ "group": self.group.tag, "was": was.as_str() }),
+            );
+        }
+
         // 2. Pool reconciliation: config list wins, otherwise trust the API.
-        let configured = self.cfg.node_specs();
+        let configured = self.cfg.node_specs_for(&self.group);
         let mut specs: Vec<NodeSpec> = if configured.is_empty() {
             selector
                 .all
@@ -155,7 +232,7 @@ impl Supervisor {
                     if !member && !self.warned_missing.contains(&spec.tag) {
                         self.logs.warn(
                             "configured_node_not_in_selector",
-                            json!({ "tag": spec.tag, "selector": self.cfg.selector.tag }),
+                            json!({ "tag": spec.tag, "selector": self.group.tag }),
                         );
                         self.warned_missing.push(spec.tag.clone());
                     }
@@ -178,7 +255,7 @@ impl Supervisor {
         // 3. External active-node change (operator via UI or curl).
         if let Some(api_active) = selector.now.as_deref() {
             if self.router.active() != Some(api_active)
-                && (self.cfg.selector.adopt_external_changes || self.router.active().is_none())
+                && (self.adopt || self.router.active().is_none())
             {
                 let events = self.router.adopt_active(Some(api_active));
                 for event in &events {
@@ -187,11 +264,11 @@ impl Supervisor {
                             .info("active_adopted", json!({ "from": from, "to": to }));
                         let record = match from {
                             Some(_) => AuditRecord::active_adopted(
-                                &self.cfg.selector.tag,
+                                &self.group.tag,
                                 from.as_deref(),
                                 Some(to),
                             ),
-                            None => AuditRecord::initial_active(&self.cfg.selector.tag, to),
+                            None => AuditRecord::initial_active(&self.group.tag, to),
                         };
                         self.logs.audit(&record);
                     }
@@ -234,7 +311,7 @@ impl Supervisor {
         }
 
         // 6. End-to-end proof for the active node (and intercept diagnosis).
-        if self.cfg.probe.method != ProbeMethod::ClashDelay && self.probes.e2e_enabled() {
+        if self.probe_cfg.method != ProbeMethod::ClashDelay && self.probes.e2e_enabled() {
             if let Some(active) = self.router.active().map(|tag| tag.to_string()) {
                 let delay_ok = self
                     .router
@@ -259,13 +336,14 @@ impl Supervisor {
                         }),
                     );
                     self.logs.audit(&AuditRecord::intercept_broken(
-                        &self.cfg.selector.tag,
+                        &self.group.tag,
                         Some(&active),
                         report.outcome.label(),
                     ));
                     send_async(
                         &self.notifier,
                         NotifyEvent::InterceptBroken {
+                            group: self.group.tag.clone(),
                             detail: format!(
                                 "{} via {}: {}",
                                 active,
@@ -302,6 +380,7 @@ impl Supervisor {
         self.logs.info(
             "tick",
             json!({
+                "group": self.group.tag,
                 "active": self.router.active(),
                 "members": self.router.nodes().len(),
                 "probed": stats.probed,
@@ -310,7 +389,6 @@ impl Supervisor {
                 "switches_total": self.router.switches_total(),
             }),
         );
-        self.write_metrics(stats.duration_ms);
         stats
     }
 
@@ -370,7 +448,7 @@ impl Supervisor {
     async fn apply_switch(&mut self, switch: &Switch) {
         let reason = switch.reason.as_str();
         let record = AuditRecord::switch(
-            &self.cfg.selector.tag,
+            &self.group.tag,
             switch.from.as_deref(),
             &switch.to,
             reason,
@@ -392,14 +470,14 @@ impl Supervisor {
             return;
         }
 
-        match self.clash.select(&self.cfg.selector.tag, &switch.to).await {
+        match self.clash.select(&self.group.tag, &switch.to).await {
             Ok(result) => {
                 self.last_switch_unix = clock::unix_ms() / 1000;
                 self.extra.last_switch_unix = self.last_switch_unix;
                 self.logs.info(
                     "route_switch",
                     json!({
-                        "selector": self.cfg.selector.tag,
+                        "selector": self.group.tag,
                         "from": switch.from,
                         "to": switch.to,
                         "reason": reason,
@@ -413,6 +491,7 @@ impl Supervisor {
                 send_async(
                     &self.notifier,
                     NotifyEvent::Switch {
+                        group: self.group.tag.clone(),
                         from: switch.from.clone(),
                         to: switch.to.clone(),
                         reason: reason.to_string(),
@@ -426,7 +505,7 @@ impl Supervisor {
                 self.logs.error(
                     "route_switch_failed",
                     json!({
-                        "selector": self.cfg.selector.tag,
+                        "selector": self.group.tag,
                         "to": switch.to,
                         "error": err.to_string(),
                         "note": "state re-syncs from the API on the next tick",
@@ -438,7 +517,7 @@ impl Supervisor {
                 if matches!(err, ClashError::NotFound(_)) {
                     self.logs.error(
                         "selector_missing",
-                        json!({ "selector": self.cfg.selector.tag }),
+                        json!({ "selector": self.group.tag }),
                     );
                 }
             }
@@ -465,7 +544,7 @@ impl Supervisor {
                         }),
                     );
                     self.logs.audit(&AuditRecord::quarantine(
-                        &self.cfg.selector.tag,
+                        &self.group.tag,
                         tag,
                         reason.as_str(),
                         quarantine_ms,
@@ -474,6 +553,7 @@ impl Supervisor {
                     send_async(
                         &self.notifier,
                         NotifyEvent::Quarantine {
+                            group: self.group.tag.clone(),
                             tag: tag.clone(),
                             reason: reason.as_str().to_string(),
                             quarantine_ms,
@@ -484,8 +564,14 @@ impl Supervisor {
                 Event::QuarantineExit { tag } => {
                     self.logs.info("quarantine_exit", json!({ "tag": tag }));
                     self.logs
-                        .audit(&AuditRecord::quarantine_exit(&self.cfg.selector.tag, tag));
-                    send_async(&self.notifier, NotifyEvent::Recovered { tag: tag.clone() });
+                        .audit(&AuditRecord::quarantine_exit(&self.group.tag, tag));
+                    send_async(
+                        &self.notifier,
+                        NotifyEvent::Recovered {
+                            group: self.group.tag.clone(),
+                            tag: tag.clone(),
+                        },
+                    );
                 }
                 Event::GeoBlocked {
                     tag,
@@ -519,12 +605,13 @@ impl Supervisor {
                         }),
                     );
                     self.logs.audit(&AuditRecord::no_healthy(
-                        &self.cfg.selector.tag,
+                        &self.group.tag,
                         active.as_deref(),
                     ));
                     send_async(
                         &self.notifier,
                         NotifyEvent::NoHealthy {
+                            group: self.group.tag.clone(),
                             active: active.clone(),
                         },
                     );
@@ -540,27 +627,12 @@ impl Supervisor {
         }
     }
 
-    fn write_metrics(&mut self, loop_duration_ms: u64) {
-        self.extra.loop_duration_ms = loop_duration_ms;
-        self.extra.last_switch_unix = self.last_switch_unix;
-        let uptime = clock::mono_ms().saturating_sub(self.start_ms);
-        if let Err(err) = self.metrics.write(&self.router, &self.extra, uptime) {
-            if !self.metrics_error_logged {
-                self.metrics_error_logged = true;
-                self.logs.warn(
-                    "metrics_write_failed",
-                    json!({ "error": err.to_string(), "path": self.cfg.metrics.path }),
-                );
-            }
-        }
-    }
-
     /// Adaptive period: fast only while the **active** node is unhealthy.
     ///
     /// Standby nodes in quarantine are deliberately not a reason to speed up:
     /// a single dead backup would otherwise pin the daemon at the fast cadence
     /// forever, burning traffic and CPU for no benefit.
-    fn next_period_ms(&self) -> u64 {
+    pub fn next_period_ms(&self) -> u64 {
         let active_unhealthy = self
             .router
             .active()
@@ -568,10 +640,37 @@ impl Supervisor {
             .map(|node| node.is_quarantined() || node.consecutive_fails > 0)
             .unwrap_or(true);
         if active_unhealthy {
-            self.cfg.probe.fast_interval_ms
+            self.probe_cfg.fast_interval_ms
         } else {
-            self.cfg.probe.interval_ms
+            self.probe_cfg.interval_ms
         }
+    }
+
+    /// Группа выпала из управления: тег пропал или это не selector.
+    ///
+    /// Процесс не падает и остальные группы не останавливаются — просто эта
+    /// группа перестаёт быть источником событий. Один warn, а не по одному на
+    /// тик: иначе за час простоя журнал превращается в шум и настоящие аварии
+    /// в нём не видны.
+    fn mark_disabled(
+        &mut self,
+        reason: DisabledReason,
+        mut stats: TickStats,
+        started: std::time::Instant,
+    ) -> TickStats {
+        if self.disabled != Some(reason) {
+            self.disabled = Some(reason);
+            self.logs.warn(
+                reason.as_str(),
+                json!({
+                    "group": self.group.tag,
+                    "note": "group disabled; other groups keep ticking",
+                }),
+            );
+        }
+        self.extra.api_ok = true;
+        stats.duration_ms = started.elapsed().as_millis() as u64;
+        stats
     }
 
     /// Run until `shutdown` resolves.
@@ -597,6 +696,170 @@ impl Supervisor {
                 return Ok(());
             }
             self.tick(false).await;
+        }
+    }
+}
+
+/// Все группы в одном процессе.
+///
+/// Тики идут **последовательно**, а не параллельно: на 1 vCPU RU-ноды это
+/// единственный способ не превратить 5 групп × concurrency 3 в 15
+/// одновременных проб. Побочный плюс — лимит `probe.concurrency` работает как
+/// общий, без отдельного семафора.
+///
+/// У каждой группы свой период: пока `fr-exit` в быстром режиме (активный
+/// выход только что упал), `bt-exit` продолжает тикать раз в 5 с и не
+/// разгоняется вместе с ней.
+pub struct SupervisorSet {
+    cfg: Config,
+    groups: Vec<GroupSupervisor>,
+    /// Абсолютное время (mono_ms), когда группа должна тикнуть в следующий раз.
+    due_ms: Vec<u64>,
+    metrics: MetricsWriter,
+    logs: Logs,
+    start_ms: u64,
+    metrics_error_logged: bool,
+}
+
+impl SupervisorSet {
+    pub fn new(
+        cfg: &Config,
+        logs: Logs,
+        notifier: Option<mpsc::Sender<NotifyEvent>>,
+        dry_run: bool,
+        only: Option<&str>,
+    ) -> Result<SupervisorSet, String> {
+        let mut groups = Vec::new();
+        for group in cfg.groups() {
+            if let Some(only) = only {
+                if group.tag != only {
+                    continue;
+                }
+            }
+            let supervisor =
+                GroupSupervisor::new(cfg, group, logs.clone(), notifier.clone(), dry_run)?;
+            groups.push(supervisor);
+        }
+        if groups.is_empty() {
+            return Err(match only {
+                Some(tag) => format!("group {tag:?} is not configured"),
+                None => "no groups configured".to_string(),
+            });
+        }
+        let due_ms = vec![0; groups.len()];
+        Ok(SupervisorSet {
+            metrics: MetricsWriter::new(&cfg.metrics.path, cfg.metrics.enabled),
+            cfg: cfg.clone(),
+            groups,
+            due_ms,
+            logs,
+            start_ms: clock::mono_ms(),
+            metrics_error_logged: false,
+        })
+    }
+
+    pub fn groups(&self) -> &[GroupSupervisor] {
+        &self.groups
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// Протикнуть те группы, чей период истёк (или все при `force`).
+    pub async fn tick_due(&mut self, force: bool) -> Vec<(String, TickStats)> {
+        let now = clock::mono_ms();
+        let mut out = Vec::new();
+        for index in 0..self.groups.len() {
+            if !force && now < self.due_ms[index] {
+                continue;
+            }
+            let stats = self.groups[index].tick(force).await;
+            self.due_ms[index] = clock::mono_ms() + self.groups[index].next_period_ms();
+            out.push((self.groups[index].tag().to_string(), stats));
+        }
+        self.write_metrics();
+        out
+    }
+
+    /// Ближайший момент, когда хоть одной группе пора тикать.
+    fn next_due_ms(&self) -> u64 {
+        self.due_ms.iter().copied().min().unwrap_or(0)
+    }
+
+    /// Суммарные счётчики для старых имён метрик без лейбла.
+    fn totals(&self) -> Extra {
+        let mut totals = Extra::default();
+        totals.api_ok = true;
+        for group in &self.groups {
+            let extra = group.extra();
+            totals.probes_total += extra.probes_total;
+            totals.api_errors_total += extra.api_errors_total;
+            totals.switch_failures_total += extra.switch_failures_total;
+            totals.intercept_failures_total += extra.intercept_failures_total;
+            totals.last_switch_unix = totals.last_switch_unix.max(extra.last_switch_unix);
+            totals.api_ok &= extra.api_ok;
+        }
+        totals.loop_duration_ms = self
+            .groups
+            .iter()
+            .map(|group| group.extra().loop_duration_ms)
+            .max()
+            .unwrap_or(0);
+        totals
+    }
+
+    fn write_metrics(&mut self) {
+        let uptime = clock::mono_ms().saturating_sub(self.start_ms);
+        let totals = self.totals();
+        let views: Vec<GroupView> = self
+            .groups
+            .iter()
+            .map(|group| GroupView {
+                tag: group.tag(),
+                router: group.router(),
+                extra: group.extra(),
+                enabled: group.disabled_reason().is_none(),
+            })
+            .collect();
+        if let Err(err) = self.metrics.write(&views, &totals, uptime) {
+            if !self.metrics_error_logged {
+                self.metrics_error_logged = true;
+                self.logs.warn(
+                    "metrics_write_failed",
+                    json!({ "error": err.to_string(), "path": self.cfg.metrics.path }),
+                );
+            }
+        }
+    }
+
+    /// Run until `shutdown` resolves.
+    pub async fn run<F>(&mut self, shutdown: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
+        // Prime immediately: state, audit and metrics should exist without
+        // waiting a whole period after startup.
+        self.tick_due(true).await;
+        loop {
+            let now = clock::mono_ms();
+            let next = self.next_due_ms();
+            let wait = next.saturating_sub(now).max(1);
+            let sleep = tokio::time::sleep(std::time::Duration::from_millis(wait));
+            tokio::pin!(sleep);
+            let run_tick = tokio::select! {
+                _ = &mut sleep => true,
+                _ = &mut shutdown => false,
+            };
+            if !run_tick {
+                self.logs.info(
+                    "shutdown",
+                    json!({ "groups": self.groups.len() }),
+                );
+                return Ok(());
+            }
+            self.tick_due(false).await;
         }
     }
 }

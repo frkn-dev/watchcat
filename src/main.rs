@@ -18,7 +18,7 @@ use watchcat::clock;
 use watchcat::config::Config;
 use watchcat::log::{Level, Logs};
 use watchcat::notify::Notifier;
-use watchcat::supervisor::Supervisor;
+use watchcat::supervisor::SupervisorSet;
 use watchcat::VERSION;
 
 const HELP: &str = "\
@@ -36,6 +36,7 @@ OPTIONS:
         --dry-run           Never send PUT /proxies/… (log the intended switch)
         --force             Ignore the switch cooldown for this run
         --set <TAG>         One-shot: switch the selector to TAG via the Clash API
+        --group <TAG>       Only this group (default: every configured group)
         --log-level <LVL>   trace|debug|info|warn|error (overrides config)
     -h, --help              Show this help
     -V, --version           Show version
@@ -54,6 +55,7 @@ struct Args {
     dry_run: bool,
     force: bool,
     set: Option<String>,
+    group: Option<String>,
     log_level: Option<String>,
     help: bool,
     version: bool,
@@ -69,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
         dry_run: false,
         force: false,
         set: None,
+        group: None,
         log_level: None,
         help: false,
         version: false,
@@ -88,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
             "--dry-run" => args.dry_run = true,
             "--force" => args.force = true,
             "--set" => args.set = Some(argv.next().ok_or("--set requires a tag")?),
+            "--group" => args.group = Some(argv.next().ok_or("--group requires a tag")?),
             "--log-level" => {
                 args.log_level = Some(argv.next().ok_or("--log-level requires a value")?)
             }
@@ -133,50 +137,62 @@ fn main() -> ExitCode {
     }
 
     if args.nodes {
-        let specs = config.node_specs();
-        if specs.is_empty() {
-            println!("(no explicit node list — the pool comes from the selector at runtime)");
-        }
-        for spec in specs {
-            println!(
-                "{:<28} protocol={:<14} index={:?} priority={} pinned={}",
-                spec.tag,
-                spec.protocol.as_str(),
-                spec.index,
-                spec.priority,
-                spec.pinned
-            );
+        for group in config.groups() {
+            println!("group {}", group.tag);
+            let specs = config.node_specs_for(&group);
+            if specs.is_empty() {
+                println!("  (no explicit node list — the pool comes from the selector at runtime)");
+            }
+            for spec in specs {
+                println!(
+                    "  {:<26} protocol={:<14} index={:?} priority={} pinned={}",
+                    spec.tag,
+                    spec.protocol.as_str(),
+                    spec.index,
+                    spec.priority,
+                    spec.pinned
+                );
+            }
         }
         return ExitCode::SUCCESS;
     }
 
     if args.check {
-        let policy = config.policy();
+        let groups = config.groups();
         println!("config OK");
         println!("  api:       {}", config.api.base_url);
-        println!("  selector:  {}", config.selector.tag);
+        println!("  groups:    {}", groups.len());
+        for group in &groups {
+            let probe = config.probe_for(group);
+            let policy = config.policy_for(group);
+            println!(
+                "    {}: nodes {} ({}), margin {} %, hold {} ticks, adopt {}",
+                group.tag,
+                config.node_specs_for(group).len(),
+                if group.nodes.is_empty() {
+                    "pool from selector"
+                } else {
+                    "explicit"
+                },
+                policy.switch_margin_pct,
+                policy.switch_hold_ticks,
+                config.adopt_external(group)
+            );
+            println!(
+                "        probe: {} ms, critical {} every {} ticks, method {:?}, e2e {}",
+                probe.interval_ms,
+                probe.critical_url.as_deref().unwrap_or("(off)"),
+                probe.critical_every_ticks,
+                probe.method,
+                probe.e2e_enabled
+            );
+        }
         println!(
-            "  nodes:     {} configured{}",
-            config.selector.nodes.len(),
-            if config.selector.nodes.is_empty() {
-                " (pool read from the selector)"
-            } else {
-                ""
-            }
-        );
-        println!(
-            "  probing:   {} ms interval, {} ms fast, {} ms timeout, concurrency {}",
+            "  probing:   {} ms interval, {} ms fast, {} ms timeout, concurrency {} (shared)",
             config.probe.interval_ms,
             config.probe.fast_interval_ms,
             config.probe.timeout_ms,
             config.probe.concurrency
-        );
-        println!(
-            "  policy:    fail_threshold {}, quarantine {} ms, recovery {} probes, margin {} %",
-            policy.fail_threshold,
-            policy.quarantine_ms,
-            policy.recovery_probes,
-            policy.switch_margin_pct
         );
         println!(
             "  audit:     {}",
@@ -194,13 +210,31 @@ fn main() -> ExitCode {
     }
 
     if let Some(tag) = args.set.as_deref() {
-        return one_shot_set(&config, tag);
+        return one_shot_set(&config, tag, args.group.as_deref());
     }
 
     run(config, &args)
 }
 
-fn one_shot_set(config: &Config, tag: &str) -> ExitCode {
+fn one_shot_set(config: &Config, tag: &str, group: Option<&str>) -> ExitCode {
+    let groups = config.groups();
+    let selector = match group {
+        Some(name) => match groups.iter().find(|g| g.tag == name) {
+            Some(found) => found.tag.clone(),
+            None => {
+                eprintln!("watchcat: group {name:?} is not configured");
+                return ExitCode::from(3);
+            }
+        },
+        None if groups.len() == 1 => groups[0].tag.clone(),
+        None => {
+            eprintln!(
+                "watchcat: {} groups configured — pass --group <TAG>",
+                groups.len()
+            );
+            return ExitCode::from(3);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -219,11 +253,11 @@ fn one_shot_set(config: &Config, tag: &str) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        match client.select(&config.selector.tag, tag).await {
+        match client.select(&selector, tag).await {
             Ok(result) => {
                 println!(
                     "switched {} -> {} (http {}, {} ms)",
-                    config.selector.tag, tag, result.status, result.roundtrip_ms
+                    selector, tag, result.status, result.roundtrip_ms
                 );
                 ExitCode::SUCCESS
             }
@@ -250,12 +284,28 @@ fn run(config: Config, args: &Args) -> ExitCode {
         }
     };
 
+    // Env — не второй конфиг, а аварийный оверрайд. Если он что-то перекрыл,
+    // это надо видеть в журнале: иначе ручной прогон без env-файла молча
+    // работает не с теми настройками (ровно так A/B получил 401 и «ноль
+    // событий», что легко принять за здоровое состояние).
+    if !config.env_overrides.is_empty() {
+        logs.warn(
+            "env_override_applied",
+            serde_json::json!({ "keys": config.env_overrides }),
+        );
+    }
+
     let delivered = Arc::new(AtomicU64::new(0));
     let notifier = Notifier::spawn(config.telegram.clone(), logs.clone(), delivered.clone())
         .map(|(tx, _handle)| tx);
 
-    let mut supervisor = match Supervisor::new(config.clone(), logs.clone(), notifier, args.dry_run)
-    {
+    let mut supervisor = match SupervisorSet::new(
+        &config,
+        logs.clone(),
+        notifier,
+        args.dry_run,
+        args.group.as_deref(),
+    ) {
         Ok(supervisor) => supervisor,
         Err(err) => {
             logs.error("init_failed", serde_json::json!({ "error": err }));
@@ -263,17 +313,26 @@ fn run(config: Config, args: &Args) -> ExitCode {
         }
     };
 
+    let groups: Vec<serde_json::Value> = supervisor
+        .groups()
+        .iter()
+        .map(|group| {
+            serde_json::json!({
+                "tag": group.tag(),
+                "configured_nodes": group.configured_nodes(),
+            })
+        })
+        .collect();
+
     logs.info(
         "start",
         serde_json::json!({
             "version": VERSION,
             "api": config.api.base_url,
-            "selector": config.selector.tag,
-            "configured_nodes": config.selector.nodes.len(),
+            "groups": groups,
             "interval_ms": config.probe.interval_ms,
             "fast_interval_ms": config.probe.fast_interval_ms,
             "probe_timeout_ms": config.probe.timeout_ms,
-            "method": format!("{:?}", config.probe.method).to_ascii_lowercase(),
             "dry_run": args.dry_run,
             "audit_path": config.logging.audit_path,
             "metrics_path": if config.metrics.enabled { Some(&config.metrics.path) } else { None },
@@ -297,17 +356,21 @@ fn run(config: Config, args: &Args) -> ExitCode {
 
     runtime.block_on(async {
         if args.once {
-            let stats = supervisor.tick(args.force).await;
-            logs.info(
-                "once_complete",
-                serde_json::json!({
+            let results = supervisor.tick_due(true).await;
+            let mut all_ok = true;
+            let mut report = Vec::new();
+            for (group, stats) in &results {
+                all_ok &= stats.api_ok;
+                report.push(serde_json::json!({
+                    "group": group,
                     "api_ok": stats.api_ok,
                     "probed": stats.probed,
                     "switched": stats.switched,
                     "duration_ms": stats.duration_ms,
-                }),
-            );
-            return if stats.api_ok {
+                }));
+            }
+            logs.info("once_complete", serde_json::json!({ "groups": report }));
+            return if all_ok {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)

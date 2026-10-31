@@ -31,6 +31,9 @@ pub enum ClashError {
     Status { status: u16, message: String },
     Json(String),
     NotFound(String),
+    /// Тег существует, но это не `selector` (`urltest`, `direct`, …) —
+    /// переключать его через `PUT /proxies/{tag}` нельзя.
+    NotSelector { tag: String, kind: String },
 }
 
 impl std::fmt::Display for ClashError {
@@ -41,6 +44,9 @@ impl std::fmt::Display for ClashError {
             ClashError::Status { status, message } => write!(f, "http {status}: {message}"),
             ClashError::Json(e) => write!(f, "json: {e}"),
             ClashError::NotFound(tag) => write!(f, "proxy {tag} not found"),
+            ClashError::NotSelector { tag, kind } => {
+                write!(f, "proxy {tag} is not a selector (type {kind}) — PUT would be rejected")
+            }
         }
     }
 }
@@ -165,11 +171,9 @@ impl ClashClient {
             serde_json::from_slice(&response.body).map_err(|e| ClashError::Json(e.to_string()))?;
         let all = parsed
             .all
-            .ok_or_else(|| {
-                ClashError::Json(format!(
-                    "proxy {tag} is not a selector (type {}) — PUT would be rejected",
-                    parsed.kind.as_deref().unwrap_or("unknown")
-                ))
+            .ok_or_else(|| ClashError::NotSelector {
+                tag: tag.to_string(),
+                kind: parsed.kind.as_deref().unwrap_or("unknown").to_string(),
             })?
             .into_iter()
             .map(|tag| tag.into_owned())
@@ -346,13 +350,18 @@ mod tests {
         );
     }
 
+    /// `urltest`/`direct` вместо `selector`: отдельная ошибка, чтобы группа
+    /// уходила в disabled с внятной причиной, а не молча замирала.
     #[tokio::test]
-    async fn selector_membership_missing_is_an_error() {
+    async fn selector_membership_missing_is_not_selector() {
         let (api, _handle) =
             mock(vec![(200, "{\"type\":\"Vless\",\"now\":\"\"}".to_string())]).await;
         let client = ClashClient::new(&api).unwrap();
         let err = client.selector("node-01").await.unwrap_err();
-        assert!(matches!(err, ClashError::Json(_)), "{err:?}");
+        assert!(
+            matches!(&err, ClashError::NotSelector { kind, .. } if kind == "Vless"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

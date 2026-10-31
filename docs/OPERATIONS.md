@@ -57,7 +57,9 @@ curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://127.0.0.1:9090/proxies/ma
 
 ```bash
 install -d -o root -g root /opt/watchcat /etc/watchcat /var/log/watchcat
-install -m 0755 target/release/watchcat /opt/watchcat/watchcat
+# сборка под Linux (macOS: musl НЕ линкуется — ld не знает --as-needed)
+cargo +nightly zigbuild --release --target x86_64-unknown-linux-gnu
+install -m 0755 target/x86_64-unknown-linux-gnu/release/watchcat /opt/watchcat/watchcat
 install -m 0644 config.example.yaml /etc/watchcat/config.yaml
 $EDITOR /etc/watchcat/config.yaml        # selector.tag, api.secret, e2e_proxy
 install -m 0644 deploy/watchcat.service /etc/systemd/system/
@@ -67,14 +69,29 @@ systemctl status watchcat --no-pager
 journalctl -u watchcat -n 20 --no-pager
 ```
 
-Секрет лучше держать не в YAML, а в env-файле с правами 0600:
+Все настройки — включая секрет — живут в одном файле `/etc/watchcat/config.yaml`
+с правами 0600. Env-файла и `EnvironmentFile=` в юните нет:
 
 ```bash
-install -d -m 0750 /etc/watchcat
-printf 'WATCHCAT_API_SECRET=%s\n' "$SECRET" > /etc/watchcat/env
-chmod 0600 /etc/watchcat/env
-# в юните: EnvironmentFile=/etc/watchcat/env
+install -m 0600 config.example.yaml /etc/watchcat/config.yaml
+$EDITOR /etc/watchcat/config.yaml        # api.secret, selector.tag, e2e_proxy
 ```
+
+**Почему не env-файл.** Пока половина настроек в `/etc/watchcat/env`, а половина
+в YAML, любой ручной прогон (`--dry-run`, `--nodes`) без
+`set -a; . /etc/watchcat/env` молча работает не с теми настройками: получает
+`401 Unauthorized`, не меряет ничего и пишет пустой аудит. Пустой аудит при
+этом неотличим от «всё здорово» — на этом уже был потерян A/B-прогон.
+
+Env-переменные `WATCHCAT_*` остались только как разовый аварийный оверрайд.
+Если хоть одна из них что-то перекрыла, при старте в журнал идёт
+`env_override_applied` со списком ключей:
+
+```bash
+journalctl -u watchcat -n 20 --no-pager | grep env_override_applied
+```
+
+На боевой ноде этой строки быть не должно.
 
 Проверка конфига без сети и без сайд-эффектов:
 
@@ -92,12 +109,27 @@ chmod 0600 /etc/watchcat/env
 --collector.textfile.directory=/var/log/watchcat
 ```
 
-Основные серии: `watchcat_up`, `watchcat_active{tag}`, `watchcat_switches_total`,
-`watchcat_node_ewma_ms{tag,protocol}`, `watchcat_node_fails_total{tag}`,
-`watchcat_node_quarantined{tag}`, `watchcat_node_geo_blocked{tag}`,
-`watchcat_loop_duration_ms`, `watchcat_api_errors_total`,
-`watchcat_switch_failures_total`, `watchcat_intercept_failures_total`,
-`watchcat_last_switch_timestamp_seconds`.
+Серии без лейбла — **сумма по всем группам** (старые дашборды продолжают
+работать); серии с `group` — по конкретной группе.
+
+| серия | смысл |
+|---|---|
+| `watchcat_up` | последний тик дошёл до Clash API |
+| `watchcat_groups` | сколько групп под управлением |
+| `watchcat_switches_total` / `watchcat_group_switches_total{group}` | переключения |
+| `watchcat_probes_total` / `watchcat_group_probes_total{group}` | пробы |
+| `watchcat_group_active{group,tag}` | активный член группы |
+| `watchcat_group_enabled{group}` | 1 = группа управляется, 0 = выпала |
+| `watchcat_group_last_switch_timestamp_seconds{group}` | когда последний раз |
+| `watchcat_node_ewma_ms{group,tag,protocol}` | сглаженная задержка |
+| `watchcat_node_fails_total{group,tag}` | провалы подряд/всего |
+| `watchcat_node_quarantined{group,tag}` | в карантине |
+| `watchcat_node_geo_blocked{group,tag}` | заблокирован для critical URL |
+| `watchcat_node_switches_in_total{group,tag}` | сколько раз на ноду приходили |
+| `watchcat_loop_duration_ms`, `watchcat_api_errors_total`, `watchcat_switch_failures_total`, `watchcat_intercept_failures_total`, `watchcat_last_switch_timestamp_seconds` | диагностика, суммарно |
+
+`watchcat_active{tag}` без `group` выводится только при **одной** группе: при
+нескольких значение было бы неоднозначным.
 
 Алерты, которые имеет смысл поставить сразу:
 
@@ -106,6 +138,7 @@ chmod 0600 /etc/watchcat/env
 | `up{job="watchcat"} == 0` или `watchcat_up == 0` дольше 2 мин | демон/API недоступны |
 | `rate(watchcat_switches_total[10m]) > 0.3` | флаппинг (>3 свитча за 10 мин) |
 | `sum(watchcat_node_quarantined) == count(watchcat_node_ewma_ms)` | весь пул в карантине |
+| `watchcat_group_enabled == 0` дольше 5 мин | тег пропал из sing-box или группа не `selector` |
 | `increase(watchcat_switch_failures_total[5m]) > 0` | sing-box отвергает `PUT` |
 | `increase(watchcat_intercept_failures_total[5m]) > 0` | сломан локальный перехват, не ноды |
 
@@ -216,11 +249,19 @@ MOCK_SWITCH node-01-fr-vless -> node-02-de-hysteria (total 1)
 | `--block TAG` | end-to-end проба получает 403, когда TAG активна (гео-блок) |
 | `--secret S` | требовать `Authorization` |
 | `--no-socks` | отключить SOCKS-стенд (пробы только через delay) |
+| `--selectors A,B` | несколько групп |
+| `--pool TAG=a,b` | свой состав для группы (проверка изоляции групп) |
 
-Автотесты того же сценария (4 теста, живые бинари):
+Автотесты (6 сценариев, живые бинари; включая изоляцию двух групп:
 
 ```bash
 cargo test --test failover
+```
+
+Локальный смоук мульти-группы (2 группы, одна падает, вторая стоит):
+
+```bash
+./scripts/smoke_multi.sh
 ```
 
 ## 6. Ручные операции
@@ -229,8 +270,12 @@ cargo test --test failover
 # посмотреть, что видит демон
 watchcat --config /etc/watchcat/config.yaml --once --log-level debug
 
-# принудительно переключить (в обход политики, через Clash API)
-watchcat --config /etc/watchcat/config.yaml --set node-05-se-vless
+# принудительно переключить (в обход политики, через Clash API);
+# при нескольких группах нужен --group
+watchcat --config /etc/watchcat/config.yaml --set node-05-se-vless --group fr-exit
+
+# только одна группа: остальные в этом процессе не тикают
+watchcat --config /etc/watchcat/config.yaml --group bt-exit --once --log-level debug
 
 # проверить решение, ничего не переключая
 watchcat --config /etc/watchcat/config.yaml --dry-run --once
@@ -264,6 +309,8 @@ journalctl -u watchcat -n 5 --no-pager     # ждём "event":"start" и пер�
 | `configured_node_not_in_selector` | `selector.outbounds` не содержит тег из конфига |
 | `route_switch_failed` (400) | `PUT` с тегом, которого нет в `all`; смотрим `--once --log-level debug` |
 | `no_healthy_node` | все ноды в карантине: смотреть `watchcat_node_fails_total`, `last_seen`; проверить `all` |
+| `selector_missing` | тега нет в `/proxies/{tag}`: группа в disabled, остальные тикают. Вернули тег — группа включится сама (`selector_recovered`) |
+| `selector_not_controllable` | группа в sing-box не `selector` (`urltest`, `direct`): watchdog её не трогает. Перевести в `selector` с живым `default` — см. §4 |
 | `intercept_probe_failed` | не нода: `journalctl -u sing-box`, `ip rule`, `ip route show table 100`, `sysctl net.ipv4.conf.awg0.rp_filter` (см. `env/dev/servers/ROUTING.md` §2.1) |
 | пробы идут, но всегда `Inconclusive` | критический URL отдаёт 5xx; сменить `critical_url`/`accept_status` |
 | демон ест CPU | проверить `probe.fast_interval_ms` и не залип ли он в fast-mode (`watchcat_node_quarantined`) |
@@ -306,6 +353,8 @@ journalctl -u watchcat -f -o cat | jq -c 'select(.level!="debug")'
 | `metrics.path` | `/var/log/watchcat/metrics.prom` | textfile для node_exporter |
 | `telegram.*` | disabled | уведомления (токен лучше через env) |
 
-Правила приоритета: `env (WATCHCAT_*)` → `.env` (`WATCHCAT_ENV_FILE`, по
-умолчанию `./.env`) → YAML → дефолты. YAML строгий: неизвестный ключ — ошибка
-запуска (опечатка в `quarantine_ms` не должна молча оставить дефолт).
+Правила приоритета: YAML — единственный источник правды на ноде; env
+(`WATCHCAT_*`, `.env` через `WATCHCAT_ENV_FILE`) — только разовый оверрайд для
+отладки, и каждое его срабатывание логируется как `env_override_applied`.
+YAML строгий: неизвестный ключ — ошибка запуска (опечатка в `quarantine_ms`
+не должна молча оставить дефолт).

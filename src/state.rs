@@ -196,6 +196,13 @@ pub struct Policy {
     pub stale_ms: u64,
     /// Extra cost per protocol-rank step when picking under blocking pressure.
     pub protocol_penalty_us: u64,
+    /// Сколько тиков подряд кандидат обязан быть лучше активного на
+    /// `switch_margin_pct`, прежде чем его поставят. Один замер — это шум:
+    /// EWMA с весом 30 % на пробах раз в 5 с легко даёт разницу больше
+    /// маржи, и без выдержки роутер перекладывает трафик между почти
+    /// равными выходами десятки раз в сутки (замер на msk-tw: 220 из 284
+    /// переключений за 7.8 суток — `better_candidate`).
+    pub switch_hold_ticks: u32,
     /// Apply protocol preference penalties only when a block was observed.
     pub prefer_protocol_on_block: bool,
     /// Protocol preference order (best first). Empty ⇒ built-in order.
@@ -216,6 +223,7 @@ impl Default for Policy {
             ewma_alpha_permille: 300,
             stale_ms: 60_000,
             protocol_penalty_us: 0,
+            switch_hold_ticks: 6,
             prefer_protocol_on_block: true,
             protocol_preference: Vec::new(),
         }
@@ -392,6 +400,10 @@ pub struct RouterState {
     active: Option<String>,
     last_switch_at: u64,
     switches_total: u64,
+    /// Кандидат, который сейчас «лучше активного», и сколько тиков подряд он
+    /// держит это преимущество. Сбрасывается, как только лидер сменился или
+    /// преимущество пропало.
+    better_streak: Option<(String, u32)>,
 }
 
 impl RouterState {
@@ -402,6 +414,7 @@ impl RouterState {
             active: None,
             last_switch_at: 0,
             switches_total: 0,
+            better_streak: None,
         }
     }
 
@@ -478,6 +491,7 @@ impl RouterState {
             to: next.clone().unwrap_or_default(),
         };
         self.active = next;
+        self.better_streak = None;
         vec![event]
     }
 
@@ -686,7 +700,32 @@ impl RouterState {
         let best_score = self.score(&self.nodes[best], now, active_blocked || degraded);
         let threshold = active_score * (100 - margin_pct as u64) / 100;
 
-        if best_score < threshold {
+        if best_score >= threshold {
+            // Преимущества нет — выдержку сбрасываем, чтобы следующий
+            // «лучший» начинал считать тики заново.
+            self.better_streak = None;
+            return decision;
+        }
+
+        // Преимущество есть, но ставить его сразу нельзя: считаем, сколько
+        // тиков подряд лидер один и тот же. Смена лидера обнуляет счётчик —
+        // иначе два равных кандидата будут набирать тики друг друга.
+        let best_tag = self.nodes[best].tag().to_string();
+        let streak = match &self.better_streak {
+            Some((tag, n)) if tag == &best_tag => n.saturating_add(1),
+            _ => 1,
+        };
+        self.better_streak = Some((best_tag, streak));
+
+        // Деградация — это не шум: если активный выход просел по EWMA,
+        // выдержка не нужна, иначе трафик висит на медленном выходе лишние
+        // полминуты.
+        let hold = if degraded { 1 } else { self.policy.switch_hold_ticks.max(1) };
+        if streak < hold {
+            return decision;
+        }
+
+        {
             decision.switch = Some(Switch {
                 from: Some(self.nodes[active_idx].tag().to_string()),
                 to: self.nodes[best].tag().to_string(),
@@ -709,6 +748,7 @@ impl RouterState {
         self.nodes[idx].switches_in = self.nodes[idx].switches_in.saturating_add(1);
         self.last_switch_at = now;
         self.switches_total += 1;
+        self.better_streak = None;
     }
 
     fn any_unblocked_candidate(&self, now: u64) -> bool {
@@ -863,6 +903,22 @@ mod tests {
 
     /// Build a router with one exact first sample per node (`latency_ms` are
     /// unsmoothed, since the first sample seeds the EWMA) — active = node-01.
+    /// Роутер с выдержкой в один тик — для тестов, которые проверяют маржу
+    /// и cooldown, а не гистерезис выдержки.
+    fn router_latencies_immediate(latencies: &[u32]) -> RouterState {
+        let policy = Policy {
+            switch_hold_ticks: 1,
+            ..Policy::default()
+        };
+        let mut router = RouterState::new(policy);
+        router.sync_members(&pool(latencies.len() as u32), 0);
+        for (i, latency) in latencies.iter().enumerate() {
+            router.observe(&format!("node-{:02}-xx-vless", i + 1), &ok(*latency), 100);
+        }
+        router.adopt_active(Some("node-01-xx-vless"));
+        router
+    }
+
     fn router_latencies(latencies: &[u32]) -> RouterState {
         let mut router = RouterState::new(Policy::default());
         router.sync_members(&pool(latencies.len() as u32), 0);
@@ -927,27 +983,92 @@ mod tests {
         assert_eq!(decision.switch.unwrap().to, "node-03-xx-vless");
     }
 
+    /// Выдержка: кандидат лучше, но ставим его только после N тиков подряд.
+    /// Ровно тот дефект, из-за которого на msk-tw было 220 переключений
+    /// `better_candidate` за 7.8 суток между выходами с разницей в единицы мс.
+    #[test]
+    fn hold_ticks_require_consecutive_advantage() {
+        let mut r = router_latencies(&[100, 60, 100]);
+        let hold = r.policy().switch_hold_ticks;
+        assert!(hold >= 2, "дефолтная выдержка должна быть больше одного тика");
+
+        for tick in 1..hold {
+            assert!(
+                r.decide(2000, false).switch.is_none(),
+                "переключение на тике {tick} из {hold} — слишком рано"
+            );
+        }
+        let decision = r.decide(2000, false);
+        assert_eq!(decision.switch.unwrap().to, "node-02-xx-vless");
+        assert_eq!(r.switches_total(), 1);
+    }
+
+    /// Преимущество пропало — счётчик тиков обнуляется, и следующий кандидат
+    /// обязан отсчитывать выдержку заново.
+    #[test]
+    fn hold_streak_resets_when_advantage_disappears() {
+        let policy = Policy {
+            switch_hold_ticks: 3,
+            ..Policy::default()
+        };
+        let mut r = RouterState::new(policy);
+        r.sync_members(&pool(3), 0);
+        r.observe("node-01-xx-vless", &ok(100), 100);
+        r.observe("node-02-xx-vless", &ok(60), 100);
+        r.observe("node-03-xx-vless", &ok(100), 100);
+        r.adopt_active(Some("node-01-xx-vless"));
+
+        // Два тика преимущества — мало.
+        assert!(r.decide(2000, false).switch.is_none());
+        assert!(r.decide(2000, false).switch.is_none());
+
+        // Активный стал быстрым: преимущества больше нет, счётчик сброшен.
+        r.observe("node-01-xx-vless", &ok(10), 2100);
+        assert!(r.decide(2100, false).switch.is_none());
+
+        // Кандидат снова лучше, но отсчёт начинается с нуля.
+        r.observe("node-01-xx-vless", &ok(100), 2200);
+        assert!(r.decide(2200, false).switch.is_none());
+        assert!(r.decide(2200, false).switch.is_none());
+        assert!(
+            r.decide(2200, false).switch.is_some(),
+            "после трёх тиков подряд должен переключиться"
+        );
+    }
+
+    /// Деградация активного — не шум: выдержка не применяется, иначе трафик
+    /// висит на просевшем выходе лишние полминуты.
+    #[test]
+    fn degraded_active_switches_without_hold() {
+        let mut r = router_latencies(&[2000, 100, 100]);
+        let decision = r.decide(2000, false);
+        assert_eq!(
+            decision.switch.map(|s| s.reason),
+            Some(SwitchReason::ActiveDegraded)
+        );
+    }
+
     #[test]
     fn hysteresis_prevents_flapping() {
         // Margin is 20 %: 100 → threshold 80.
-        let r = router_latencies(&[100, 85, 100]);
+        let r = router_latencies_immediate(&[100, 85, 100]);
         assert!(r.clone().decide(2000, false).switch.is_none());
 
-        let mut r = router_latencies(&[100, 75, 100]);
+        let mut r = router_latencies_immediate(&[100, 75, 100]);
         assert!(r.decide(2000, false).switch.is_some());
     }
 
     #[test]
     fn hysteresis_respects_margin_boundary() {
-        let mut r = router_latencies(&[100, 81]);
+        let mut r = router_latencies_immediate(&[100, 81]);
         assert!(r.decide(2000, false).switch.is_none());
-        let mut r = router_latencies(&[100, 79]);
+        let mut r = router_latencies_immediate(&[100, 79]);
         assert!(r.decide(2000, false).switch.is_some());
     }
 
     #[test]
     fn cooldown_blocks_rapid_switches() {
-        let mut router = router_latencies(&[100, 100, 100]);
+        let mut router = router_latencies_immediate(&[100, 100, 100]);
         router.observe("node-02-xx-vless", &ok(10), 200);
         assert!(router.decide(2000, false).switch.is_some());
         let after_first = router.active().unwrap().to_string();
@@ -963,7 +1084,7 @@ mod tests {
 
     #[test]
     fn forced_decide_ignores_cooldown() {
-        let mut router = router_latencies(&[100, 100, 100]);
+        let mut router = router_latencies_immediate(&[100, 100, 100]);
         router.observe("node-02-xx-vless", &ok(10), 200);
         assert!(router.decide(2000, false).switch.is_some());
         router.observe("node-02-xx-vless", &ok(900), 2100);

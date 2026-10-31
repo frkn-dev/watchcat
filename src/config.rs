@@ -45,12 +45,24 @@ impl std::error::Error for ConfigError {}
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub api: ApiConfig,
-    pub selector: SelectorConfig,
+    /// Одна группа (старый формат). `None` — если задан `selectors`.
+    pub selector: Option<SelectorConfig>,
+    /// Несколько групп выходов в одном процессе.
+    pub selectors: Vec<GroupConfig>,
     pub probe: ProbeConfig,
     pub policy: PolicyConfig,
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
     pub telegram: TelegramConfig,
+    /// Ключи, которые пришли из env и перекрыли YAML. Пусто на боевой ноде —
+    /// значит единственный источник правды конфиг-файл. Не сериализуется:
+    /// это диагностика, а не настройка.
+    #[serde(skip)]
+    pub env_overrides: Vec<String>,
+    /// Env-ключи, которые в текущем режиме не имеют смысла и поэтому
+    /// проигнорированы (например `WATCHCAT_SELECTOR` при `selectors:`).
+    #[serde(skip)]
+    pub env_ignored: Vec<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -92,6 +104,49 @@ pub struct SelectorConfig {
     pub nodes: Vec<NodeConfig>,
     /// Adopt a selector change made by an operator instead of fighting it.
     pub adopt_external_changes: bool,
+}
+
+/// Одна группа выходов внутри `selectors:`.
+///
+/// `probe` и `policy` — оверрайды глобальных секций, применяются по ключу
+/// целиком (никакого частичного мержа вложенных объектов): иначе нельзя
+/// понять, что именно в итоге действует.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GroupConfig {
+    pub tag: String,
+    /// Явный пул. Пусто ⇒ состав берётся из поля `all` группы в Clash API.
+    pub nodes: Vec<NodeConfig>,
+    /// Подхватывать чужое переключение. `None` ⇒ глобальное значение.
+    pub adopt_external_changes: Option<bool>,
+    pub probe: Option<ProbeOverrides>,
+    pub policy: Option<PolicyConfig>,
+}
+
+impl From<SelectorConfig> for GroupConfig {
+    fn from(selector: SelectorConfig) -> GroupConfig {
+        GroupConfig {
+            tag: selector.tag,
+            nodes: selector.nodes,
+            adopt_external_changes: Some(selector.adopt_external_changes),
+            probe: None,
+            policy: None,
+        }
+    }
+}
+
+/// Per-group overrides of `probe:`. Only the fields that genuinely differ
+/// between groups live here — a RU-exit cannot be measured with the same URL as
+/// a FR-exit, and `bt-exit` does not proxy HTTPS at all.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProbeOverrides {
+    pub base_url: Option<String>,
+    pub critical_url: Option<String>,
+    pub e2e_proxy: Option<String>,
+    pub e2e_enabled: Option<bool>,
+    pub critical_every_ticks: Option<u32>,
+    pub method: Option<ProbeMethod>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,6 +229,9 @@ pub struct PolicyConfig {
     pub degrade_factor_pct: Option<u32>,
     pub min_switch_interval_ms: Option<u64>,
     pub switch_margin_pct: Option<u32>,
+    /// Сколько тиков подряд кандидат должен быть лучше активного, прежде чем
+    /// его поставят. 1 = старое поведение (переключаться по первому замеру).
+    pub switch_hold_ticks: Option<u32>,
     pub recovery_probes: Option<u32>,
     pub ewma_alpha_permille: Option<u32>,
     pub stale_ms: Option<u64>,
@@ -257,11 +315,10 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             api: ApiConfig::default(),
-            selector: SelectorConfig {
-                tag: "main-outbound".to_string(),
-                nodes: Vec::new(),
-                adopt_external_changes: true,
-            },
+            // Группы не задаются по умолчанию: пустой конфиг — ошибка запуска,
+            // а не «молча управляем несуществующим main-outbound».
+            selector: None,
+            selectors: Vec::new(),
             probe: ProbeConfig::default(),
             policy: PolicyConfig::default(),
             logging: LoggingConfig::default(),
@@ -273,6 +330,8 @@ impl Default for Config {
                 api_base: "https://api.telegram.org".to_string(),
                 min_interval_ms: 3_000,
             },
+            env_overrides: Vec::new(),
+            env_ignored: Vec::new(),
         }
     }
 }
@@ -305,7 +364,9 @@ impl Config {
             }
         };
 
-        config.apply_env(&env);
+        let (applied, ignored) = config.apply_env(&env);
+        config.env_overrides = applied;
+        config.env_ignored = ignored;
         config.normalize();
         config.validate()?;
         Ok(config)
@@ -346,7 +407,18 @@ impl Config {
         }
     }
 
-    fn apply_env(&mut self, env: &BTreeMap<String, String>) {
+    /// Применяет env-оверрайды и возвращает список ключей, которые реально
+    /// что-то изменили.
+    ///
+    /// Env существует только для разовых прогонов и отладки. На боевой ноде
+    /// единственный источник правды — YAML: когда половина настроек в
+    /// `/etc/watchcat/env`, а половина в `config.yaml`, ручной запуск без
+    /// `set -a; . env` молча получает 401 и «ноль событий», что легко принять
+    /// за здоровое состояние. Поэтому вызывающий логирует каждое
+    /// переопределение.
+    fn apply_env(&mut self, env: &BTreeMap<String, String>) -> (Vec<String>, Vec<String>) {
+        let mut applied: Vec<String> = Vec::new();
+        let mut ignored: Vec<String> = Vec::new();
         let get = |key: &str| env.get(key).map(|v| v.trim()).filter(|v| !v.is_empty());
         let get_u64 = |key: &str| get(key).and_then(|v| v.parse::<u64>().ok());
         let get_u32 = |key: &str| get(key).and_then(|v| v.parse::<u32>().ok());
@@ -354,57 +426,150 @@ impl Config {
 
         if let Some(v) = get("WATCHCAT_API_URL") {
             self.api.base_url = v.to_string();
+            applied.push("WATCHCAT_API_URL".to_string());
         }
         if let Some(v) = get("WATCHCAT_API_SECRET") {
             self.api.secret = Some(v.to_string());
+            applied.push("WATCHCAT_API_SECRET".to_string());
         }
         if let Some(v) = get_u64("WATCHCAT_API_TIMEOUT_MS") {
             self.api.timeout_ms = v;
+            applied.push("WATCHCAT_API_TIMEOUT_MS".to_string());
         }
         if let Some(v) = get("WATCHCAT_SELECTOR") {
-            self.selector.tag = v.to_string();
+            // В мульти-групповом режиме переименовать «какую-то» группу — значит
+            // тихо поменять то, чем управляем. Такой оверрайд не применяем.
+            if self.selectors.is_empty() {
+                self.selector.get_or_insert_with(SelectorConfig::default).tag = v.to_string();
+                applied.push("WATCHCAT_SELECTOR".to_string());
+            } else {
+                ignored.push("WATCHCAT_SELECTOR".to_string());
+            }
         }
         if let Some(v) = get_u64("WATCHCAT_INTERVAL_MS") {
             self.probe.interval_ms = v;
+            applied.push("WATCHCAT_INTERVAL_MS".to_string());
         }
         if let Some(v) = get_u64("WATCHCAT_PROBE_TIMEOUT_MS") {
             self.probe.timeout_ms = v;
+            applied.push("WATCHCAT_PROBE_TIMEOUT_MS".to_string());
         }
         if let Some(v) = get_u32("WATCHCAT_FAIL_THRESHOLD") {
             self.policy.fail_threshold = Some(v);
+            applied.push("WATCHCAT_FAIL_THRESHOLD".to_string());
         }
         if let Some(v) = get_u64("WATCHCAT_QUARANTINE_MS") {
             self.policy.quarantine_ms = Some(v);
+            applied.push("WATCHCAT_QUARANTINE_MS".to_string());
         }
         if let Some(v) = get("WATCHCAT_LOG_LEVEL") {
             self.logging.level = v.to_ascii_lowercase();
+            applied.push("WATCHCAT_LOG_LEVEL".to_string());
         }
         if let Some(v) = get("WATCHCAT_AUDIT_PATH") {
             self.logging.audit_path = Some(v.to_string());
+            applied.push("WATCHCAT_AUDIT_PATH".to_string());
         }
         if let Some(v) = get_bool("WATCHCAT_STDOUT") {
             self.logging.stdout = v;
+            applied.push("WATCHCAT_STDOUT".to_string());
         }
         if let Some(v) = get("WATCHCAT_TELEGRAM_TOKEN") {
             self.telegram.bot_token = Some(v.to_string());
             self.telegram.enabled = true;
+            applied.push("WATCHCAT_TELEGRAM_TOKEN".to_string());
         }
         if let Some(v) = get("WATCHCAT_TELEGRAM_CHAT") {
             self.telegram.chat_id = Some(v.to_string());
+            applied.push("WATCHCAT_TELEGRAM_CHAT".to_string());
         }
         if let Some(v) = get("WATCHCAT_METRICS_PATH") {
             self.metrics.path = v.to_string();
+            applied.push("WATCHCAT_METRICS_PATH".to_string());
         }
         if let Some(v) = get_bool("WATCHCAT_METRICS") {
             self.metrics.enabled = v;
+            applied.push("WATCHCAT_METRICS".to_string());
         }
+
+        (applied, ignored)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.selector.tag.trim().is_empty() {
+        if self.selector.is_some() && !self.selectors.is_empty() {
             return Err(ConfigError::Invalid(
-                "selector.tag must not be empty".to_string(),
+                "use either `selector:` (one group) or `selectors:` (a list), not both"
+                    .to_string(),
             ));
+        }
+        if self.selectors.is_empty() && self.selector.is_none() {
+            return Err(ConfigError::Invalid(
+                "no groups configured: set `selector:` or `selectors:`".to_string(),
+            ));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for group in &self.groups() {
+            if group.tag.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "group tag must not be empty".to_string(),
+                ));
+            }
+            if seen.contains(&group.tag.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate group tag {:?}: two supervisors on one selector fight each other",
+                    group.tag
+                )));
+            }
+            seen.push(&group.tag);
+            if let Some(over) = &group.probe {
+                if let Some(url) = &over.base_url {
+                    Url::parse(url).map_err(|e| {
+                        ConfigError::Invalid(format!("group {}: probe.base_url: {e}", group.tag))
+                    })?;
+                }
+                if let Some(url) = &over.critical_url {
+                    if !url.trim().is_empty() {
+                        Url::parse(url).map_err(|e| {
+                            ConfigError::Invalid(format!(
+                                "group {}: probe.critical_url: {e}",
+                                group.tag
+                            ))
+                        })?;
+                    }
+                }
+                if let Some(proxy) = &over.e2e_proxy {
+                    let proxy = Url::parse(proxy).map_err(|e| {
+                        ConfigError::Invalid(format!("group {}: probe.e2e_proxy: {e}", group.tag))
+                    })?;
+                    if proxy.scheme != "socks5" && proxy.scheme != "socks5h" {
+                        return Err(ConfigError::Invalid(format!(
+                            "group {}: probe.e2e_proxy must be a socks5:// URL",
+                            group.tag
+                        )));
+                    }
+                }
+            }
+            if let Some(policy) = &group.policy {
+                Self::apply_policy(Policy::default(), policy)
+                    .validate()
+                    .map_err(|e| ConfigError::Invalid(format!("group {}: {e}", group.tag)))?;
+            }
+            for node in &group.nodes {
+                if node.tag.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "group {}: nodes[].tag must not be empty",
+                        group.tag
+                    )));
+                }
+                if let Some(protocol) = &node.protocol {
+                    if Protocol::from_token(&protocol.to_ascii_lowercase()).is_none() {
+                        return Err(ConfigError::Invalid(format!(
+                            "group {}: nodes[{}].protocol: unknown protocol {protocol}",
+                            group.tag, node.tag
+                        )));
+                    }
+                }
+            }
         }
         let api = Url::parse(&self.api.base_url)
             .map_err(|e| ConfigError::Invalid(format!("api.base_url: {e}")))?;
@@ -450,21 +615,6 @@ impl Config {
                 ));
             }
         }
-        for node in &self.selector.nodes {
-            if node.tag.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "selector.nodes[].tag must not be empty".to_string(),
-                ));
-            }
-            if let Some(protocol) = &node.protocol {
-                if Protocol::from_token(&protocol.to_ascii_lowercase()).is_none() {
-                    return Err(ConfigError::Invalid(format!(
-                        "selector.nodes[{}].protocol: unknown protocol {protocol}",
-                        node.tag
-                    )));
-                }
-            }
-        }
         if self.telegram.enabled
             && (self.telegram.bot_token.is_none() || self.telegram.chat_id.is_none())
         {
@@ -483,8 +633,18 @@ impl Config {
 
     /// Effective policy (config overrides applied on top of defaults).
     pub fn policy(&self) -> Policy {
-        let mut policy = Policy::default();
-        let cfg = &self.policy;
+        Self::apply_policy(Policy::default(), &self.policy)
+    }
+
+    /// Групповые оверрайды ложатся поверх глобальной секции `policy`.
+    pub fn policy_for(&self, group: &GroupConfig) -> Policy {
+        match &group.policy {
+            Some(over) => Self::apply_policy(self.policy(), over),
+            None => self.policy(),
+        }
+    }
+
+    fn apply_policy(mut policy: Policy, cfg: &PolicyConfig) -> Policy {
         if let Some(v) = cfg.fail_threshold {
             policy.fail_threshold = v;
         }
@@ -505,6 +665,9 @@ impl Config {
         }
         if let Some(v) = cfg.switch_margin_pct {
             policy.switch_margin_pct = v;
+        }
+        if let Some(v) = cfg.switch_hold_ticks {
+            policy.switch_hold_ticks = v;
         }
         if let Some(v) = cfg.recovery_probes {
             policy.recovery_probes = v;
@@ -530,9 +693,59 @@ impl Config {
         policy
     }
 
-    /// Node specs from config; empty means "use the selector's member list".
-    pub fn node_specs(&self) -> Vec<NodeSpec> {
-        self.selector
+    /// Группы, которыми управляет процесс.
+    ///
+    /// `selectors:` побеждает; `selector:` — формат одной группы и остаётся
+    /// валидным, чтобы старые конфиги запускались без правок.
+    pub fn groups(&self) -> Vec<GroupConfig> {
+        if !self.selectors.is_empty() {
+            return self.selectors.clone();
+        }
+        self.selector.clone().map(GroupConfig::from).into_iter().collect()
+    }
+
+    /// Глобальные настройки проб с оверрайдами конкретной группы.
+    pub fn probe_for(&self, group: &GroupConfig) -> ProbeConfig {
+        let mut probe = self.probe.clone();
+        if let Some(over) = &group.probe {
+            if let Some(url) = &over.base_url {
+                probe.base_url = url.clone();
+            }
+            if let Some(url) = &over.critical_url {
+                let trimmed = url.trim();
+                probe.critical_url = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            if let Some(proxy) = &over.e2e_proxy {
+                probe.e2e_proxy = proxy.clone();
+            }
+            if let Some(enabled) = over.e2e_enabled {
+                probe.e2e_enabled = enabled;
+            }
+            if let Some(every) = over.critical_every_ticks {
+                probe.critical_every_ticks = every;
+            }
+            if let Some(method) = over.method {
+                probe.method = method;
+            }
+        }
+        probe
+    }
+
+    /// Подхватывать ли чужое переключение в этой группе.
+    pub fn adopt_external(&self, group: &GroupConfig) -> bool {
+        group
+            .adopt_external_changes
+            .or_else(|| self.selector.as_ref().map(|s| s.adopt_external_changes))
+            .unwrap_or(true)
+    }
+
+    /// Node specs группы; пусто — значит состав берётся из Clash API.
+    pub fn node_specs_for(&self, group: &GroupConfig) -> Vec<NodeSpec> {
+        group
             .nodes
             .iter()
             .map(|node| {
@@ -586,7 +799,7 @@ mod tests {
         // `secret: ""` / `critical_url: ""` is what templates leave behind;
         // they must mean "unset", not "an empty bearer token" / "invalid url".
         let config = Config::from_yaml(
-            "api:\n  secret: \"\"\nprobe:\n  critical_url: \"  \"\ntelegram:\n  bot_token: \"\"\n  chat_id: \"\"\n",
+            "api:\n  secret: \"\"\nselector:\n  tag: main-outbound\nprobe:\n  critical_url: \"  \"\ntelegram:\n  bot_token: \"\"\n  chat_id: \"\"\n",
         )
         .unwrap();
         assert!(config.api.secret.is_none());
@@ -594,6 +807,17 @@ mod tests {
         assert!(config.telegram.bot_token.is_none());
         assert!(config.telegram.chat_id.is_none());
         assert!(config.validate().is_ok(), "empty optionals must validate");
+    }
+
+    /// Конфиг с одной группой — база для тестов, которым группа не важна.
+    fn with_group() -> Config {
+        let mut config = Config::default();
+        config.selector = Some(SelectorConfig {
+            tag: "main-outbound".to_string(),
+            nodes: Vec::new(),
+            adopt_external_changes: true,
+        });
+        config
     }
 
     const MINIMAL: &str = r#"
@@ -619,8 +843,8 @@ policy:
     #[test]
     fn parses_minimal_yaml() {
         let config = Config::from_yaml(MINIMAL).unwrap();
-        assert_eq!(config.selector.tag, "main-outbound");
-        assert_eq!(config.selector.nodes.len(), 2);
+        assert_eq!(config.groups()[0].tag, "main-outbound");
+        assert_eq!(config.groups()[0].nodes.len(), 2);
         assert_eq!(config.probe.interval_ms, 5000);
         let policy = config.policy();
         assert_eq!(policy.fail_threshold, 2);
@@ -633,7 +857,7 @@ policy:
     #[test]
     fn derives_node_specs_from_tags_and_overrides() {
         let config = Config::from_yaml(MINIMAL).unwrap();
-        let specs = config.node_specs();
+        let specs = config.node_specs_for(&config.groups()[0]);
         assert_eq!(specs[0].protocol, Protocol::Vless);
         assert_eq!(specs[0].index, Some(1));
         assert_eq!(specs[1].protocol, Protocol::Hysteria2);
@@ -649,8 +873,8 @@ policy:
 
     #[test]
     fn rejects_empty_selector() {
-        let mut config = Config::default();
-        config.selector.tag = "  ".to_string();
+        let mut config = with_group();
+        config.selector.as_mut().unwrap().tag = "  ".to_string();
         assert!(config.validate().is_err());
     }
 
@@ -673,7 +897,7 @@ policy:
 
     #[test]
     fn telegram_requires_credentials() {
-        let mut config = Config::default();
+        let mut config = with_group();
         config.telegram.enabled = true;
         assert!(config.validate().is_err());
         config.telegram.bot_token = Some("t".into());
@@ -688,10 +912,128 @@ policy:
         env.insert("WATCHCAT_API_SECRET".to_string(), "from-env".to_string());
         env.insert("WATCHCAT_INTERVAL_MS".to_string(), "1000".to_string());
         env.insert("WATCHCAT_SELECTOR".to_string(), "other".to_string());
-        config.apply_env(&env);
+        let (applied, ignored) = config.apply_env(&env);
+        assert_eq!(
+            applied,
+            vec![
+                "WATCHCAT_API_SECRET".to_string(),
+                "WATCHCAT_SELECTOR".to_string(),
+                "WATCHCAT_INTERVAL_MS".to_string(),
+            ]
+        );
+        assert!(ignored.is_empty());
         assert_eq!(config.api.secret.as_deref(), Some("from-env"));
         assert_eq!(config.probe.interval_ms, 1000);
-        assert_eq!(config.selector.tag, "other");
+        assert_eq!(config.groups()[0].tag, "other");
+    }
+
+    /// Боевой сценарий: секрет в YAML, env пустой. Ни одного оверрайда,
+    /// секрет доехал до ApiConfig.
+    #[test]
+    fn secret_from_yaml_without_env() {
+        let mut config = Config::from_yaml(MINIMAL).unwrap();
+        let (applied, ignored) = config.apply_env(&BTreeMap::new());
+        assert!(applied.is_empty(), "env не должен ничего перекрывать");
+        assert!(ignored.is_empty());
+        config.normalize();
+        assert_eq!(config.api.secret.as_deref(), Some("s3cr3t"));
+        assert!(config.validate().is_ok());
+    }
+
+    // ---------------------------------------------------------------- multi-group
+
+    const TWO_GROUPS: &str = r#"
+api:
+  base_url: "http://127.0.0.1:9090"
+  secret: "s3cr3t"
+selectors:
+  - tag: fr-exit
+    policy:
+      switch_hold_ticks: 6
+      switch_margin_pct: 30
+  - tag: bt-exit
+    probe:
+      base_url: "https://www.gstatic.com/generate_204"
+      critical_url: ""
+      e2e_enabled: false
+"#;
+
+    #[test]
+    fn parses_two_groups() {
+        let config = Config::from_yaml(TWO_GROUPS).unwrap();
+        config.validate().unwrap();
+        let groups = config.groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].tag, "fr-exit");
+        assert_eq!(groups[1].tag, "bt-exit");
+    }
+
+    /// Групповые оверрайды не должны протекать в соседнюю группу.
+    #[test]
+    fn group_overrides_are_isolated() {
+        let config = Config::from_yaml(TWO_GROUPS).unwrap();
+        let groups = config.groups();
+
+        let fr = config.policy_for(&groups[0]);
+        let bt = config.policy_for(&groups[1]);
+        assert_eq!(fr.switch_hold_ticks, 6);
+        assert_eq!(fr.switch_margin_pct, 30);
+        // bt-exit ничего не переопределяла — только дефолты
+        assert_eq!(bt.switch_hold_ticks, Policy::default().switch_hold_ticks);
+        assert_eq!(bt.switch_margin_pct, Policy::default().switch_margin_pct);
+
+        let bt_probe = config.probe_for(&groups[1]);
+        assert_eq!(bt_probe.base_url, "https://www.gstatic.com/generate_204");
+        assert!(bt_probe.critical_url.is_none(), "пустая строка = выключено");
+        assert!(!bt_probe.e2e_enabled);
+
+        let fr_probe = config.probe_for(&groups[0]);
+        assert_eq!(fr_probe.base_url, config.probe.base_url);
+        assert!(fr_probe.e2e_enabled);
+    }
+
+    #[test]
+    fn selector_and_selectors_together_is_an_error() {
+        let yaml = format!(
+            "{}selector:\n  tag: legacy\n",
+            TWO_GROUPS
+        );
+        let config = Config::from_yaml(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_group_tags_are_rejected() {
+        let yaml = TWO_GROUPS.replace("tag: bt-exit", "tag: fr-exit");
+        let config = Config::from_yaml(&yaml).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate group tag"), "{err}");
+    }
+
+    /// Старый конфиг с одним `selector:` работает без правок и превращается
+    /// в одну группу.
+    #[test]
+    fn legacy_selector_is_one_group() {
+        let config = Config::from_yaml(MINIMAL).unwrap();
+        config.validate().unwrap();
+        let groups = config.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tag, "main-outbound");
+        assert_eq!(config.probe_for(&groups[0]).interval_ms, 5000);
+    }
+
+    /// В мульти-групповом режиме `WATCHCAT_SELECTOR` переименовал бы «какую-то»
+    /// группу — такой оверрайд игнорируется и попадает в отчёт.
+    #[test]
+    fn env_selector_ignored_in_multi_group() {
+        let mut config = Config::from_yaml(TWO_GROUPS).unwrap();
+        let mut env = BTreeMap::new();
+        env.insert("WATCHCAT_SELECTOR".to_string(), "renamed".to_string());
+        let (applied, ignored) = config.apply_env(&env);
+        assert!(applied.is_empty());
+        assert_eq!(ignored, vec!["WATCHCAT_SELECTOR".to_string()]);
+        assert_eq!(config.groups()[0].tag, "fr-exit");
     }
 
     #[test]

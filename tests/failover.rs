@@ -172,6 +172,62 @@ telegram:
         path
     }
 
+    /// Конфиг с двумя группами: `fr-exit` (падает) и `bt-exit` (жив).
+    fn write_multi_config(&self) -> PathBuf {
+        let config = format!(
+            r#"
+api:
+  base_url: "{api}"
+  secret: "test-secret"
+  connect_timeout_ms: 300
+  timeout_ms: 1000
+selectors:
+  - tag: fr-exit
+  - tag: bt-exit
+probe:
+  interval_ms: 150
+  fast_interval_ms: 100
+  timeout_ms: 400
+  concurrency: 10
+  method: both
+  base_url: "http://1.1.1.1/cdn-cgi/trace"
+  critical_url: "http://api.openai.com/v1/models"
+  critical_every_ticks: 1
+  accept_status: [200, 204, 401]
+  block_status: [403, 451]
+  e2e_proxy: "{socks}"
+  e2e_enabled: true
+policy:
+  fail_threshold: 2
+  quarantine_ms: 1500
+  min_switch_interval_ms: 0
+  recovery_probes: 1
+  stale_ms: 5000
+logging:
+  level: debug
+  format: json
+  stdout: true
+  audit_path: "{audit}"
+metrics:
+  enabled: true
+  path: "{metrics}"
+telegram:
+  enabled: false
+"#,
+            api = self.api_url,
+            socks = self.socks_url,
+            audit = self.audit.display(),
+            metrics = self.dir.join("metrics.prom").display(),
+        );
+        let path = self.dir.join("multi.yaml");
+        std::fs::write(&path, config).unwrap();
+        path
+    }
+
+    fn metrics(&self) -> String {
+        std::fs::read_to_string(self.dir.join("metrics.prom")).unwrap_or_default()
+    }
+
     fn run_daemon(&self, config: &PathBuf, timeout: Duration) -> Vec<String> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_watchcat"))
             .arg("--config")
@@ -252,6 +308,92 @@ fn failing_active_node_is_quarantined_and_traffic_moves() {
             .any(|line| line.contains("\"event\":\"intercept_probe_ok\"")),
         "expected a successful end-to-end probe in {lines:?}"
     );
+
+    let _ = std::fs::remove_dir_all(&stack.dir);
+}
+
+/// Приёмочный критерий мульти-группы: падение в одной группе не двигает
+/// вторую, счётчики и активные члены у групп свои.
+#[test]
+fn two_groups_are_isolated() {
+    // fr-exit работает на всём пуле, где node-01 падает; bt-exit — на своём,
+    // целиком здоровом.
+    let stack = start_mock(
+        &[
+            "--selectors",
+            "fr-exit,bt-exit",
+            "--fail",
+            "node-01-fr-vless",
+            "--pool",
+            "bt-exit=node-05-fr-vless,node-06-fr-vless",
+        ],
+        "multigroup",
+    );
+    let config = stack.write_multi_config();
+
+    let lines = stack.run_daemon(&config, Duration::from_secs(5));
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("\"event\":\"start\"")),
+        "no start event in {lines:?}"
+    );
+
+    // fr-exit переключилась...
+    let switch = wait_for_line(&stack.mock_lines, "MOCK_SWITCH", Duration::from_secs(2));
+    assert!(
+        switch.starts_with("MOCK_SWITCH fr-exit "),
+        "switch must belong to fr-exit: {switch}"
+    );
+
+    // ...а bt-exit — нет.
+    let switches: Vec<String> = stack
+        .mock_lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.starts_with("MOCK_SWITCH"))
+        .cloned()
+        .collect();
+    assert!(
+        !switches.iter().any(|line| line.contains("bt-exit")),
+        "bt-exit must stay put: {switches:?}"
+    );
+
+    let audit = stack.audit_lines();
+    let route_switches: Vec<&serde_json::Value> = audit
+        .iter()
+        .filter(|record| record["event"] == "route_switch")
+        .collect();
+    assert!(!route_switches.is_empty(), "no route_switch in {audit:?}");
+    assert!(
+        route_switches
+            .iter()
+            .all(|record| record["selector"] == "fr-exit"),
+        "switches must carry the group tag: {route_switches:?}"
+    );
+
+    // Метрики: у каждой группы своя серия, суммы не смешаны.
+    let metrics = stack.metrics();
+    assert!(
+        metrics.contains("watchcat_group_enabled{group=\"fr-exit\"} 1"),
+        "metrics: {metrics}"
+    );
+    assert!(
+        metrics.contains("watchcat_group_enabled{group=\"bt-exit\"} 1"),
+        "metrics: {metrics}"
+    );
+    assert!(
+        metrics.contains("watchcat_group_switches_total{group=\"bt-exit\"} 0"),
+        "bt-exit must have zero switches: {metrics}"
+    );
+    assert!(
+        metrics.contains("watchcat_group_active{group=\"bt-exit\",tag=\"node-05-fr-vless\"} 1"),
+        "bt-exit active must stay node-05: {metrics}"
+    );
+    // Старое имя без лейбла осталось суммой.
+    assert!(metrics.contains("watchcat_switches_total 1"), "metrics: {metrics}");
 
     let _ = std::fs::remove_dir_all(&stack.dir);
 }
