@@ -235,7 +235,10 @@ impl Notifier {
         Ok(())
     }
 
+    /// `handle` обязателен: `main` синхронный, и `tokio::spawn` вне рантайма
+    /// паникует («no reactor running») — ровно так 0.4.0 уронил ноду.
     pub fn spawn(
+        handle: &tokio::runtime::Handle,
         cfg: TelegramConfig,
         logs: Logs,
         delivered: Arc<AtomicU64>,
@@ -251,7 +254,7 @@ impl Notifier {
             }
         };
         let (tx, mut rx) = mpsc::channel::<NotifyEvent>(CHANNEL_CAPACITY);
-        let handle = tokio::spawn(async move {
+        let join = handle.spawn(async move {
             let mut throttle = Throttle::new(notifier.cfg.min_interval_ms);
             while let Some(event) = rx.recv().await {
                 let now = crate::clock::mono_ms();
@@ -279,7 +282,7 @@ impl Notifier {
                 }
             }
         });
-        Some((tx, handle))
+        Some((tx, join))
     }
 }
 

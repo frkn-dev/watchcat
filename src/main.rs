@@ -295,14 +295,33 @@ fn run(config: Config, args: &Args) -> ExitCode {
         );
     }
 
+    // main синхронный, поэтому рантайм создаём здесь: ниже он же крутит
+    // основной цикл, а `Handle` нужен, чтобы запустить задачи приёмников
+    // (tokio::spawn вне рантайма паникует — так 0.4.0 уронил ноду).
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            logs.error(
+                "runtime_failed",
+                serde_json::json!({ "error": err.to_string() }),
+            );
+            return ExitCode::from(1);
+        }
+    };
+
     let delivered = Arc::new(AtomicU64::new(0));
-    let telegram_tx = Notifier::spawn(config.telegram.clone(), logs.clone(), delivered.clone())
+    let rt = runtime.handle().clone();
+    let telegram_tx = Notifier::spawn(&rt, config.telegram.clone(), logs.clone(), delivered.clone())
         .map(|(tx, _handle)| tx);
 
     // Основной путь оповещений: сигнал в api, решение — там.
     // Telegram напрямую с ноды остаётся как опция (telegram.enabled).
     let report_stats = Arc::new(watchcat::report::ReportStats::default());
     let reporter_tx = watchcat::report::Reporter::spawn(
+        &rt,
         config.reporting.clone(),
         logs.clone(),
         report_stats.clone(),
@@ -370,20 +389,6 @@ fn run(config: Config, args: &Args) -> ExitCode {
             "pid": std::process::id(),
         }),
     );
-
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            logs.error(
-                "runtime_failed",
-                serde_json::json!({ "error": err.to_string() }),
-            );
-            return ExitCode::from(1);
-        }
-    };
 
     runtime.block_on(async {
         if args.once {

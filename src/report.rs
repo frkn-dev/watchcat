@@ -196,7 +196,10 @@ impl Reporter {
     }
 
     /// Запускает фоновую отправку. `None` — reporting выключен.
+    /// `handle` обязателен: `main` синхронный, `tokio::spawn` вне рантайма
+    /// паникует. Тест `spawn_from_sync_context_does_not_panic` это стережёт.
     pub fn spawn(
+        handle: &tokio::runtime::Handle,
         cfg: ReportingConfig,
         logs: Logs,
         stats: Arc<ReportStats>,
@@ -212,7 +215,7 @@ impl Reporter {
             }
         };
         let (tx, mut rx) = mpsc::channel::<NotifyEvent>(QUEUE_CAPACITY);
-        let handle = tokio::spawn(async move {
+        let join = handle.spawn(async move {
             // Шлём по одному событию за раз: переключения редкие, а пачка
             // одновременных соединений к api при шторме никому не нужна.
             let mut pending: VecDeque<NotifyEvent> = VecDeque::new();
@@ -234,7 +237,7 @@ impl Reporter {
                 }
             }
         });
-        Some((tx, handle))
+        Some((tx, join))
     }
 }
 

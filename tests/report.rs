@@ -59,7 +59,9 @@ async fn reporter_posts_switch_to_api() {
         attempts: 1,
     };
     let stats = Arc::new(ReportStats::default());
-    let (tx, _handle) = Reporter::spawn(cfg, Logs::for_tests(Level::Error), stats.clone()).expect("spawn");
+    let handle = tokio::runtime::Handle::current();
+    let (tx, _handle) =
+        Reporter::spawn(&handle, cfg, Logs::for_tests(Level::Error), stats.clone()).expect("spawn");
     let bus = EventBus::new(vec![tx]);
 
     bus.send(NotifyEvent::Switch {
@@ -123,11 +125,41 @@ async fn disabled_reporting_creates_no_sink() {
         timeout_ms: 100,
         attempts: 1,
     };
-    let spawned = Reporter::spawn(cfg, Logs::for_tests(Level::Error), Arc::new(ReportStats::default()));
+    let handle = tokio::runtime::Handle::current();
+    let spawned = Reporter::spawn(
+        &handle,
+        cfg,
+        Logs::for_tests(Level::Error),
+        Arc::new(ReportStats::default()),
+    );
     assert!(spawned.is_none());
     assert!(EventBus::new(vec![]).is_empty());
 }
 
 fn find_body_start(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Регрессия 0.4.0: `main` синхронный, и `tokio::spawn` вне рантайма паникует
+/// («no reactor running»), роняя процесс на старте. Теперь задача стартует
+/// через Handle, полученный снаружи, — проверяем ровно этот сценарий.
+#[test]
+fn spawn_from_sync_context_does_not_panic() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handle = runtime.handle().clone();
+
+    let cfg = ReportingConfig {
+        enabled: true,
+        url: "http://127.0.0.1:9".to_string(),
+        token: Some("t".to_string()),
+        node: "n".to_string(),
+        timeout_ms: 50,
+        attempts: 1,
+    };
+    // Вне block_on: раньше здесь был паник.
+    let spawned = Reporter::spawn(&handle, cfg, Logs::for_tests(Level::Error), Arc::new(ReportStats::default()));
+    assert!(spawned.is_some(), "канал создаётся и в синхронном контексте");
 }
