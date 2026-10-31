@@ -54,6 +54,9 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
     pub telegram: TelegramConfig,
+    /// Отправка событий в api (основной путь оповещений).
+    #[serde(default)]
+    pub reporting: ReportingConfig,
     /// Ключи, которые пришли из env и перекрыли YAML. Пусто на боевой ноде —
     /// значит единственный источник правды конфиг-файл. Не сериализуется:
     /// это диагностика, а не настройка.
@@ -311,6 +314,65 @@ impl fmt::Debug for TelegramConfig {
     }
 }
 
+/// Куда watchcat шлёт сигналы о событиях.
+///
+/// Демон не уведомляет сам: он отправляет факт в api, а api решает, кого и
+/// когда оповещать (там же живут пороги и токен Telegram). Поэтому здесь
+/// только адрес, токен и имя ноды.
+#[derive(Clone, Deserialize)]
+pub struct ReportingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// База api, например `http://127.0.0.1:3000` или `https://api.frkn.org`.
+    #[serde(default)]
+    pub url: String,
+    /// Токен сервиса (тот же, что у ноды для mgmt-ручек).
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Имя ноды в отчётах: по нему api ищет реестр и группирует события.
+    #[serde(default)]
+    pub node: String,
+    #[serde(default = "default_reporting_timeout")]
+    pub timeout_ms: u64,
+    /// Сколько раз пробуем отправить одно событие, прежде чем уронить его.
+    #[serde(default = "default_reporting_attempts")]
+    pub attempts: u32,
+}
+
+fn default_reporting_timeout() -> u64 {
+    5_000
+}
+
+fn default_reporting_attempts() -> u32 {
+    3
+}
+
+impl fmt::Debug for ReportingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReportingConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("node", &self.node)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("attempts", &self.attempts)
+            .finish()
+    }
+}
+
+impl Default for ReportingConfig {
+    fn default() -> Self {
+        ReportingConfig {
+            enabled: false,
+            url: String::new(),
+            token: None,
+            node: String::new(),
+            timeout_ms: default_reporting_timeout(),
+            attempts: default_reporting_attempts(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -330,6 +392,7 @@ impl Default for Config {
                 api_base: "https://api.telegram.org".to_string(),
                 min_interval_ms: 3_000,
             },
+            reporting: ReportingConfig::default(),
             env_overrides: Vec::new(),
             env_ignored: Vec::new(),
         }
@@ -496,6 +559,23 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.reporting.enabled {
+            if self.reporting.url.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "reporting: включено, но `reporting.url` пуст".to_string(),
+                ));
+            }
+            if self.reporting.token.as_deref().unwrap_or("").is_empty() {
+                return Err(ConfigError::Invalid(
+                    "reporting: включено, но `reporting.token` пуст".to_string(),
+                ));
+            }
+            if self.reporting.node.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "reporting: включено, но `reporting.node` пуст".to_string(),
+                ));
+            }
+        }
         if self.selector.is_some() && !self.selectors.is_empty() {
             return Err(ConfigError::Invalid(
                 "use either `selector:` (one group) or `selectors:` (a list), not both"

@@ -114,6 +114,26 @@ metrics:
   enabled: true
   path: "/var/log/watchcat/metrics.prom"   # для node_exporter textfile-collector
 
+# Куда слать события: в api, а не в Telegram напрямую.
+#
+# Почему так: демон знает только факт («переключил fr-exit: ufo-fr49 -> ufo-fr50»),
+# а кого и как часто оповещать — решает api, у которого есть реестр нод,
+# история и пороги. Токен Telegram на нодах при этом не нужен вообще.
+#
+# Токен — сервисный, тот же, что в [api] token у ноды.
+# События: switch (смена маршрута), no_healthy (выходов не осталось),
+# intercept_broken (узел отвечает, а перехват нет), quarantine, recovered.
+reporting:
+  enabled: true
+  url: "http://127.0.0.1:3000"
+  token: "change-me-in-production"
+  node: "msk-tw.frkn.org"     # имя ноды в отчётах
+  timeout_ms: 5000
+  attempts: 3
+
+# Прямая отправка в Telegram с ноды. Оставлено для отладки и как резерв:
+# на боевых нодах держим выключенным, иначе уведомления дублируются
+# (api и демон шлют одно и то же своими словами).
 telegram:
   enabled: false
   bot_token: ""              # лучше через WATCHCAT_TELEGRAM_TOKEN

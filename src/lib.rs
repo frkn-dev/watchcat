@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod net;
 pub mod notify;
 pub mod parse;
+pub mod report;
 pub mod state;
 pub mod supervisor;
 

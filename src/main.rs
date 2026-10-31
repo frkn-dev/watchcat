@@ -296,8 +296,39 @@ fn run(config: Config, args: &Args) -> ExitCode {
     }
 
     let delivered = Arc::new(AtomicU64::new(0));
-    let notifier = Notifier::spawn(config.telegram.clone(), logs.clone(), delivered.clone())
+    let telegram_tx = Notifier::spawn(config.telegram.clone(), logs.clone(), delivered.clone())
         .map(|(tx, _handle)| tx);
+
+    // Основной путь оповещений: сигнал в api, решение — там.
+    // Telegram напрямую с ноды остаётся как опция (telegram.enabled).
+    let report_stats = Arc::new(watchcat::report::ReportStats::default());
+    let reporter_tx = watchcat::report::Reporter::spawn(
+        config.reporting.clone(),
+        logs.clone(),
+        report_stats.clone(),
+    )
+    .map(|(tx, _handle)| tx);
+
+    let notifier = watchcat::notify::EventBus::new(
+        [telegram_tx, reporter_tx].into_iter().flatten().collect(),
+    );
+    if notifier.is_empty() {
+        logs.warn(
+            "no_notify_sinks",
+            serde_json::json!({
+                "hint": "telegram.enabled=false и reporting.enabled=false: переключения видны только в audit и метриках",
+            }),
+        );
+    } else {
+        logs.info(
+            "notify_sinks",
+            serde_json::json!({
+                "telegram": config.telegram.enabled,
+                "api": config.reporting.enabled,
+                "node": config.reporting.node,
+            }),
+        );
+    }
 
     let mut supervisor = match SupervisorSet::new(
         &config,

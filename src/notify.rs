@@ -62,6 +62,17 @@ pub enum NotifyEvent {
 }
 
 impl NotifyEvent {
+    /// Группа выходов, к которой относится событие.
+    pub fn group(&self) -> &str {
+        match self {
+            NotifyEvent::Switch { group, .. }
+            | NotifyEvent::Quarantine { group, .. }
+            | NotifyEvent::Recovered { group, .. }
+            | NotifyEvent::NoHealthy { group, .. }
+            | NotifyEvent::InterceptBroken { group, .. } => group,
+        }
+    }
+
     pub fn render(&self) -> String {
         match self {
             NotifyEvent::Switch {
@@ -276,6 +287,35 @@ impl Notifier {
 pub fn send_async(tx: &Option<mpsc::Sender<NotifyEvent>>, event: NotifyEvent) {
     if let Some(tx) = tx {
         let _ = tx.try_send(event);
+    }
+}
+
+/// Куда уходят события. Раньше был один канал (Telegram), теперь их два:
+/// Telegram остаётся опциональным, а api-репортёр — основной путь, потому что
+/// решение «кого и когда оповещать» принимает api, а не демон на ноде.
+///
+/// Пустая шина — валидное состояние (dry-run, всё выключено): событие просто
+/// никуда не идёт и не блокирует цикл проб.
+#[derive(Clone, Default)]
+pub struct EventBus {
+    sinks: Vec<mpsc::Sender<NotifyEvent>>,
+}
+
+impl EventBus {
+    pub fn new(sinks: Vec<mpsc::Sender<NotifyEvent>>) -> EventBus {
+        EventBus { sinks }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sinks.is_empty()
+    }
+
+    /// Отправляет событие во все приёмники. Полная очередь одного приёмника
+    /// не мешает остальным: у каждого свой канал.
+    pub fn send(&self, event: NotifyEvent) {
+        for sink in &self.sinks {
+            let _ = sink.try_send(event.clone());
+        }
     }
 }
 

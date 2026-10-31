@@ -30,7 +30,7 @@ use crate::config::{Config, GroupConfig, ProbeConfig, ProbeMethod};
 use crate::health::{ProbeEngine, ProbeReport};
 use crate::log::{AuditRecord, Logs};
 use crate::metrics::{Extra, GroupView, MetricsWriter};
-use crate::notify::{send_async, NotifyEvent};
+use crate::notify::{EventBus, NotifyEvent};
 use crate::state::{Event, NodeSpec, Outcome, RouterState, Switch};
 
 #[derive(Debug, Default, Clone)]
@@ -55,7 +55,7 @@ pub struct GroupSupervisor {
     probes: ProbeEngine,
     router: RouterState,
     logs: Logs,
-    notifier: Option<mpsc::Sender<NotifyEvent>>,
+    notifier: EventBus,
     extra: Extra,
     tick_count: u64,
     dry_run: bool,
@@ -88,7 +88,7 @@ impl GroupSupervisor {
         cfg: &Config,
         group: GroupConfig,
         logs: Logs,
-        notifier: Option<mpsc::Sender<NotifyEvent>>,
+        notifier: EventBus,
         dry_run: bool,
     ) -> Result<GroupSupervisor, String> {
         let clash = Arc::new(ClashClient::new(&cfg.api)?);
@@ -340,9 +340,7 @@ impl GroupSupervisor {
                         Some(&active),
                         report.outcome.label(),
                     ));
-                    send_async(
-                        &self.notifier,
-                        NotifyEvent::InterceptBroken {
+                    self.notifier.send(NotifyEvent::InterceptBroken {
                             group: self.group.tag.clone(),
                             detail: format!(
                                 "{} via {}: {}",
@@ -488,9 +486,7 @@ impl GroupSupervisor {
                 );
                 self.logs
                     .audit(&record.switch_result(true, result.roundtrip_ms, "probe"));
-                send_async(
-                    &self.notifier,
-                    NotifyEvent::Switch {
+                self.notifier.send(NotifyEvent::Switch {
                         group: self.group.tag.clone(),
                         from: switch.from.clone(),
                         to: switch.to.clone(),
@@ -550,9 +546,7 @@ impl GroupSupervisor {
                         quarantine_ms,
                         *fails,
                     ));
-                    send_async(
-                        &self.notifier,
-                        NotifyEvent::Quarantine {
+                    self.notifier.send(NotifyEvent::Quarantine {
                             group: self.group.tag.clone(),
                             tag: tag.clone(),
                             reason: reason.as_str().to_string(),
@@ -565,9 +559,7 @@ impl GroupSupervisor {
                     self.logs.info("quarantine_exit", json!({ "tag": tag }));
                     self.logs
                         .audit(&AuditRecord::quarantine_exit(&self.group.tag, tag));
-                    send_async(
-                        &self.notifier,
-                        NotifyEvent::Recovered {
+                    self.notifier.send(NotifyEvent::Recovered {
                             group: self.group.tag.clone(),
                             tag: tag.clone(),
                         },
@@ -608,9 +600,7 @@ impl GroupSupervisor {
                         &self.group.tag,
                         active.as_deref(),
                     ));
-                    send_async(
-                        &self.notifier,
-                        NotifyEvent::NoHealthy {
+                    self.notifier.send(NotifyEvent::NoHealthy {
                             group: self.group.tag.clone(),
                             active: active.clone(),
                         },
@@ -725,7 +715,7 @@ impl SupervisorSet {
     pub fn new(
         cfg: &Config,
         logs: Logs,
-        notifier: Option<mpsc::Sender<NotifyEvent>>,
+        notifier: EventBus,
         dry_run: bool,
         only: Option<&str>,
     ) -> Result<SupervisorSet, String> {
