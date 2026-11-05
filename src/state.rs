@@ -186,6 +186,13 @@ pub struct Policy {
     pub degrade_factor_pct: u32,
     /// Minimum time between two switches, except when the active node died.
     pub min_switch_interval_ms: u64,
+    /// Budget for non-urgent switches (`active_degraded` / `better_candidate`):
+    /// at most one per this interval. A lost exit (`active_failed`,
+    /// `active_blocked`, a member that vanished) switches immediately and
+    /// ignores the budget — no access is worse than one extra switch.
+    /// Measured on msk-tw: without the budget the router moved traffic between
+    /// near-equal exits dozens of times per hour of jitter.
+    pub degrade_switch_cooldown_ms: u64,
     /// A candidate must be this much faster to displace a healthy active node.
     pub switch_margin_pct: u32,
     /// Consecutive good probes needed to leave quarantine.
@@ -218,6 +225,7 @@ impl Default for Policy {
             degrade_ms: 1_200,
             degrade_factor_pct: 250,
             min_switch_interval_ms: 1_500,
+            degrade_switch_cooldown_ms: 3_600_000,
             switch_margin_pct: 20,
             recovery_probes: 2,
             ewma_alpha_permille: 300,
@@ -366,6 +374,14 @@ pub enum Event {
     NoHealthy {
         active: Option<String>,
     },
+    /// A switch was wanted but the hourly budget for non-urgent switches
+    /// refused it. Emitted once per episode, not on every tick.
+    SwitchDeferred {
+        from: String,
+        to: String,
+        reason: SwitchReason,
+        retry_in_ms: u64,
+    },
     MemberAdded {
         tag: String,
     },
@@ -404,6 +420,9 @@ pub struct RouterState {
     /// держит это преимущество. Сбрасывается, как только лидер сменился или
     /// преимущество пропало.
     better_streak: Option<(String, u32)>,
+    /// True once the hourly budget has refused a switch, so the suppression is
+    /// reported once per episode instead of on every tick.
+    deferred_notified: bool,
 }
 
 impl RouterState {
@@ -415,6 +434,7 @@ impl RouterState {
             last_switch_at: 0,
             switches_total: 0,
             better_streak: None,
+            deferred_notified: false,
         }
     }
 
@@ -672,14 +692,9 @@ impl RouterState {
             return decision;
         }
 
-        // 3. Healthy active: displace only with a clearly better candidate and
-        //    only outside the cooldown window.
-        let cooldown_ok =
-            force || now.saturating_sub(self.last_switch_at) >= self.policy.min_switch_interval_ms;
-        if !cooldown_ok {
-            return decision;
-        }
-
+        // 3. Healthy active: displace only with a clearly better candidate.
+        //    The switch itself is rate-limited further down, once a switch is
+        //    actually about to happen (see the hourly budget).
         let margin_pct = if degraded {
             0
         } else {
@@ -725,15 +740,41 @@ impl RouterState {
             return decision;
         }
 
+        // Hourly budget for non-urgent switches. Urgent cases returned above
+        // (quarantine/blocked/missing member), so reaching this point always
+        // means "the active exit still works, a better one appeared".
+        let reason = if degraded {
+            SwitchReason::ActiveDegraded
+        } else {
+            SwitchReason::BetterCandidate
+        };
+        let cooldown_ms = self
+            .policy
+            .min_switch_interval_ms
+            .max(self.policy.degrade_switch_cooldown_ms);
+        let since_last = now.saturating_sub(self.last_switch_at);
+        // `switches_total == 0` means nothing has been switched yet in this
+        // process lifetime, so there is nothing to protect from: otherwise a
+        // restart would pin a degraded exit in place for a full hour.
+        let budget_active = self.switches_total > 0;
+        if !force && budget_active && since_last < cooldown_ms {
+            if !self.deferred_notified {
+                self.deferred_notified = true;
+                decision.events.push(Event::SwitchDeferred {
+                    from: self.nodes[active_idx].tag().to_string(),
+                    to: self.nodes[best].tag().to_string(),
+                    reason,
+                    retry_in_ms: cooldown_ms - since_last,
+                });
+            }
+            return decision;
+        }
+
         {
             decision.switch = Some(Switch {
                 from: Some(self.nodes[active_idx].tag().to_string()),
                 to: self.nodes[best].tag().to_string(),
-                reason: if degraded {
-                    SwitchReason::ActiveDegraded
-                } else {
-                    SwitchReason::BetterCandidate
-                },
+                reason,
                 latency_ms: self.nodes[best].ewma_ms(),
                 from_fails: self.nodes[active_idx].consecutive_fails,
             });
@@ -749,6 +790,7 @@ impl RouterState {
         self.last_switch_at = now;
         self.switches_total += 1;
         self.better_streak = None;
+        self.deferred_notified = false;
     }
 
     fn any_unblocked_candidate(&self, now: u64) -> bool {
@@ -901,6 +943,8 @@ mod tests {
         router
     }
 
+    /// Router with an explicit non-urgent switch budget — for the tests that
+    /// exercise the budget itself instead of the production default (1 h).
     /// Build a router with one exact first sample per node (`latency_ms` are
     /// unsmoothed, since the first sample seeds the EWMA) — active = node-01.
     /// Роутер с выдержкой в один тик — для тестов, которые проверяют маржу
@@ -908,6 +952,24 @@ mod tests {
     fn router_latencies_immediate(latencies: &[u32]) -> RouterState {
         let policy = Policy {
             switch_hold_ticks: 1,
+            ..Policy::default()
+        };
+        let mut router = RouterState::new(policy);
+        router.sync_members(&pool(latencies.len() as u32), 0);
+        for (i, latency) in latencies.iter().enumerate() {
+            router.observe(&format!("node-{:02}-xx-vless", i + 1), &ok(*latency), 100);
+        }
+        router.adopt_active(Some("node-01-xx-vless"));
+        router
+    }
+
+    /// Same as [`router_latencies_immediate`], with a custom budget for
+    /// non-urgent switches.
+    fn router_latencies_budget(latencies: &[u32], budget_ms: u64) -> RouterState {
+        let policy = Policy {
+            switch_hold_ticks: 1,
+            min_switch_interval_ms: 1_500,
+            degrade_switch_cooldown_ms: budget_ms,
             ..Policy::default()
         };
         let mut router = RouterState::new(policy);
@@ -1068,7 +1130,7 @@ mod tests {
 
     #[test]
     fn cooldown_blocks_rapid_switches() {
-        let mut router = router_latencies_immediate(&[100, 100, 100]);
+        let mut router = router_latencies_budget(&[100, 100, 100], 1_500);
         router.observe("node-02-xx-vless", &ok(10), 200);
         assert!(router.decide(2000, false).switch.is_some());
         let after_first = router.active().unwrap().to_string();
@@ -1084,13 +1146,83 @@ mod tests {
 
     #[test]
     fn forced_decide_ignores_cooldown() {
-        let mut router = router_latencies_immediate(&[100, 100, 100]);
+        let mut router = router_latencies_budget(&[100, 100, 100], 1_500);
         router.observe("node-02-xx-vless", &ok(10), 200);
         assert!(router.decide(2000, false).switch.is_some());
         router.observe("node-02-xx-vless", &ok(900), 2100);
         router.observe("node-03-xx-vless", &ok(10), 2100);
         assert!(router.decide(2100, false).switch.is_none());
         assert!(router.decide(2100, true).switch.is_some());
+    }
+
+    /// Неаварийная смена — не чаще раза в час: деградация ждёт бюджет,
+    /// событие пишется один раз на эпизод, а не каждый тик.
+    #[test]
+    fn degraded_switch_waits_for_the_hourly_budget() {
+        let mut r = router_latencies_immediate(&[2000, 100, 100]);
+        let first = r.decide(2_000, false);
+        assert_eq!(
+            first.switch.map(|s| s.reason),
+            Some(SwitchReason::ActiveDegraded),
+            "первая деградация переключает сразу: бюджет ещё не тратился"
+        );
+
+        // Через минуту просел новый активный выход (EWMA уходит за degrade_ms),
+        // рядом есть быстрый.
+        r.observe("node-02-xx-vless", &ok(5000), 62_000);
+        r.observe("node-03-xx-vless", &ok(50), 62_000);
+        let second = r.decide(62_000, false);
+        assert!(second.switch.is_none(), "не чаще раза в час");
+        assert!(
+            second.events.iter().any(|e| matches!(
+                e,
+                Event::SwitchDeferred {
+                    reason: SwitchReason::ActiveDegraded,
+                    ..
+                }
+            )),
+            "придержанная смена должна попасть в лог: {:?}",
+            second.events
+        );
+
+        // Следующий тик того же эпизода событие не дублирует.
+        r.observe("node-02-xx-vless", &ok(5000), 67_000);
+        let third = r.decide(67_000, false);
+        assert!(third.switch.is_none());
+        assert!(
+            !third
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::SwitchDeferred { .. })),
+            "событие пишется один раз на эпизод: {:?}",
+            third.events
+        );
+
+        // Час с первой смены прошёл — машина снова имеет право переключиться.
+        r.observe("node-02-xx-vless", &ok(5000), 3_700_000);
+        r.observe("node-03-xx-vless", &ok(50), 3_700_000);
+        assert!(r.decide(3_700_000, false).switch.is_some());
+    }
+
+    /// Потеря доступа бюджет игнорирует: смена немедленная.
+    #[test]
+    fn lost_exit_switches_immediately_inside_the_budget() {
+        let mut r = router_latencies_immediate(&[100, 100, 100]);
+        r.observe("node-02-xx-vless", &ok(10), 200);
+        assert_eq!(
+            r.decide(2_000, false).switch.map(|s| s.reason),
+            Some(SwitchReason::BetterCandidate),
+            "первая смена тратит бюджет"
+        );
+
+        // Активный выход перестал отвечать — карантин после двух провалов.
+        r.observe("node-02-xx-vless", &Outcome::Timeout, 2_500);
+        r.observe("node-02-xx-vless", &Outcome::Timeout, 3_000);
+        assert_eq!(
+            r.decide(3_000, false).switch.map(|s| s.reason),
+            Some(SwitchReason::ActiveFailed),
+            "нет доступа — переключаемся невзирая на бюджет"
+        );
     }
 
     #[test]

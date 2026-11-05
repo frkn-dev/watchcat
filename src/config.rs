@@ -231,6 +231,9 @@ pub struct PolicyConfig {
     pub degrade_ms: Option<u32>,
     pub degrade_factor_pct: Option<u32>,
     pub min_switch_interval_ms: Option<u64>,
+    /// Budget for non-urgent switches (`active_degraded` / `better_candidate`):
+    /// at most one per this interval. A lost exit switches immediately.
+    pub degrade_switch_cooldown_ms: Option<u64>,
     pub switch_margin_pct: Option<u32>,
     /// Сколько тиков подряд кандидат должен быть лучше активного, прежде чем
     /// его поставят. 1 = старое поведение (переключаться по первому замеру).
@@ -743,6 +746,9 @@ impl Config {
         if let Some(v) = cfg.min_switch_interval_ms {
             policy.min_switch_interval_ms = v;
         }
+        if let Some(v) = cfg.degrade_switch_cooldown_ms {
+            policy.degrade_switch_cooldown_ms = v;
+        }
         if let Some(v) = cfg.switch_margin_pct {
             policy.switch_margin_pct = v;
         }
@@ -932,6 +938,16 @@ policy:
         // untouched defaults survive
         assert_eq!(policy.switch_margin_pct, 20);
         assert_eq!(policy.recovery_probes, 2);
+        // Non-urgent switches are budgeted at one per hour by default; a lost
+        // exit ignores the budget (see RouterState::decide).
+        assert_eq!(policy.degrade_switch_cooldown_ms, 3_600_000);
+    }
+
+    #[test]
+    fn parses_switch_budget_override() {
+        let yaml = format!("{MINIMAL}  degrade_switch_cooldown_ms: 900000\n");
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(config.policy().degrade_switch_cooldown_ms, 900_000);
     }
 
     #[test]

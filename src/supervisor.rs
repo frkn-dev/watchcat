@@ -606,6 +606,25 @@ impl GroupSupervisor {
                         },
                     );
                 }
+                Event::SwitchDeferred {
+                    from,
+                    to,
+                    reason,
+                    retry_in_ms,
+                } => {
+                    // Not an alert: the scheduler held itself back on purpose.
+                    // Logged (once per episode) so an empty audit does not read
+                    // as "the watchdog is dead".
+                    self.logs.info(
+                        "switch_deferred",
+                        json!({
+                            "from": from,
+                            "to": to,
+                            "reason": reason.as_str(),
+                            "retry_in_ms": retry_in_ms,
+                        }),
+                    );
+                }
                 Event::MemberAdded { tag } => {
                     self.logs.info("member_added", json!({ "tag": tag }));
                 }

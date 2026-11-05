@@ -179,6 +179,10 @@ fn main() -> ExitCode {
                 config.adopt_external(group)
             );
             println!(
+                "        switch budget: non-urgent (degraded/better) at most every {} s; lost exit switches immediately",
+                policy.degrade_switch_cooldown_ms / 1000
+            );
+            println!(
                 "        probe: {} ms, critical {} every {} ticks, method {:?}, e2e {}",
                 probe.interval_ms,
                 probe.critical_url.as_deref().unwrap_or("(off)"),

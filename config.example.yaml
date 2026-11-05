@@ -93,6 +93,9 @@ policy:
   degrade_ms: 1200           # абсолютный потолок EWMA
   degrade_factor_pct: 250    # или 2.5× медианы здоровых нод
   min_switch_interval_ms: 1500
+  # Бюджет неаварийных переключений: degraded/better — не чаще раза в час.
+  # Потеря доступа (active_failed / active_blocked) переключается немедленно.
+  degrade_switch_cooldown_ms: 3600000
   switch_margin_pct: 20      # кандидат должен быть на 20% быстрее, иначе не дёргаем
   switch_hold_ticks: 6       # и держать это преимущество 6 тиков подряд (30 с при 5-секундной пробе)
   recovery_probes: 2         # сколько успехов подряд нужно для выхода из карантина

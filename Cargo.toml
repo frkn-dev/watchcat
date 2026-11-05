@@ -1,6 +1,6 @@
 [package]
 name = "watchcat"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.75"
 description = "sing-box outbound watchdog: Clash API health detection and selector failover"
