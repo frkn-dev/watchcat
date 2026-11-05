@@ -423,6 +423,10 @@ pub struct RouterState {
     /// True once the hourly budget has refused a switch, so the suppression is
     /// reported once per episode instead of on every tick.
     deferred_notified: bool,
+    /// True once the current "no live exits" episode has been reported. The
+    /// state itself lasts many ticks (fast interval is 1 s), and every tick
+    /// used to fire an alert: 180 Telegram messages in four minutes.
+    no_healthy_notified: bool,
 }
 
 impl RouterState {
@@ -435,6 +439,7 @@ impl RouterState {
             switches_total: 0,
             better_streak: None,
             deferred_notified: false,
+            no_healthy_notified: false,
         }
     }
 
@@ -614,6 +619,12 @@ impl RouterState {
     pub fn decide(&mut self, now: u64, force: bool) -> Decision {
         let mut decision = Decision::default();
 
+        // A live candidate means the previous "no live exits" episode is over,
+        // even if this tick does not switch (e.g. the active one got healthy).
+        if self.no_healthy_notified && self.best_candidate(now, None).is_some() {
+            self.no_healthy_notified = false;
+        }
+
         let active_tag = self.active.clone();
         let active_idx = active_tag
             .as_ref()
@@ -638,9 +649,7 @@ impl RouterState {
                     });
                     self.commit_switch(best, now);
                 } else {
-                    decision
-                        .events
-                        .push(Event::NoHealthy { active: active_tag });
+                    self.push_no_healthy(active_tag, &mut decision.events);
                 }
                 return decision;
             }
@@ -686,9 +695,10 @@ impl RouterState {
                 self.commit_switch(best, now);
                 return decision;
             }
-            decision.events.push(Event::NoHealthy {
-                active: Some(self.nodes[active_idx].tag().to_string()),
-            });
+            self.push_no_healthy(
+                Some(self.nodes[active_idx].tag().to_string()),
+                &mut decision.events,
+            );
             return decision;
         }
 
@@ -706,9 +716,8 @@ impl RouterState {
             // candidate (stale/quarantined), this is a real outage: say so
             // instead of silently staying put.
             if !self.is_candidate(&self.nodes[active_idx], now) {
-                decision.events.push(Event::NoHealthy {
-                    active: Some(self.nodes[active_idx].tag().to_string()),
-                });
+                let tag = self.nodes[active_idx].tag().to_string();
+                self.push_no_healthy(Some(tag), &mut decision.events);
             }
             return decision;
         };
@@ -784,6 +793,19 @@ impl RouterState {
         decision
     }
 
+    /// Emits `NoHealthy` at most once per episode: the emitter is called on
+    /// every tick, and the fast interval is one second, so an unguarded push
+    /// turns one outage into a Telegram flood (180 messages in four minutes).
+    /// The flag is cleared by a switch and by `decide` once a candidate is
+    /// healthy again, so the next real outage still alerts.
+    fn push_no_healthy(&mut self, active: Option<String>, events: &mut Vec<Event>) {
+        if self.no_healthy_notified {
+            return;
+        }
+        self.no_healthy_notified = true;
+        events.push(Event::NoHealthy { active });
+    }
+
     fn commit_switch(&mut self, idx: usize, now: u64) {
         self.active = Some(self.nodes[idx].tag().to_string());
         self.nodes[idx].switches_in = self.nodes[idx].switches_in.saturating_add(1);
@@ -791,6 +813,7 @@ impl RouterState {
         self.switches_total += 1;
         self.better_streak = None;
         self.deferred_notified = false;
+        self.no_healthy_notified = false;
     }
 
     fn any_unblocked_candidate(&self, now: u64) -> bool {
@@ -1298,6 +1321,70 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::NoHealthy { .. })));
         assert_eq!(router.active(), Some("node-01-xx-vless"));
+    }
+
+    #[test]
+    fn no_healthy_is_reported_once_per_episode() {
+        // Regression: the emitter runs every tick (1 s in fast mode), so an
+        // unguarded push produced ~180 Telegram messages in four minutes.
+        let mut router = router(2, 40);
+        for tag in ["node-01-xx-vless", "node-02-xx-vless"] {
+            router.observe(tag, &Outcome::Timeout, 1000);
+            router.observe(tag, &Outcome::Timeout, 2000);
+        }
+
+        let first = router.decide(2000, false);
+        assert!(first
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::NoHealthy { .. })));
+
+        let second = router.decide(3000, false);
+        assert!(
+            !second
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::NoHealthy { .. })),
+            "same episode must not alert twice"
+        );
+
+        assert!(router.no_healthy_notified, "episode must be marked as reported");
+
+        // Recovery clears the flag, so the next real outage still alerts.
+        // A single good probe does not lift a quarantine: wait it out first,
+        // otherwise the "recovery" is not a recovery at all.
+        let until = router
+            .get("node-01-xx-vless")
+            .map(|node| node.quarantined_until)
+            .unwrap_or(0);
+        let healed_at = until + 1;
+        // `recovery_probes` good samples are needed to leave quarantine — one
+        // success is intentionally not enough.
+        for offset in 0..2u64 {
+            router.observe(
+                "node-01-xx-vless",
+                &Outcome::Ok {
+                    latency_ms: 40,
+                    status: 204,
+                },
+                healed_at + offset,
+            );
+        }
+        router.decide(healed_at + 1, false);
+        assert!(
+            !router.no_healthy_notified,
+            "a healthy candidate must end the episode"
+        );
+
+        // Every probe is now long stale: no candidates again, so a new episode.
+        let again = router.decide(600_000, false);
+        assert!(
+            again
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::NoHealthy { .. })),
+            "a new episode must alert again"
+        );
     }
 
     #[test]
